@@ -29,6 +29,10 @@ flowmind.config.toml
 out/
 ._lv_work/
 
+# 本地视频测试素材与流水线产物（大体积二进制，不入库）
+/*.mp4
+*.bak
+
 # local debug artifacts
 cc_debug.png
 *.png.tmp
