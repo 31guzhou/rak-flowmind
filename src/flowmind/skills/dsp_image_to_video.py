@@ -1,8 +1,11 @@
 """image_to_video 技能：图生视频（逐镜产出视频底 · 契约 §7.5 第 1 步）。
 
 契约 §7.5：运镜（``apply-camera-motion``）**只接受视频**，故「让静态图动起来」需
-**先有视频底**。本技能就是那个第 1 步——**逐镜**把素材图 + 镜头文案喂给图生视频模型，
-产出**真视频片段**，落 ``{cachePrefix}/{runId}/clips/{shotId}.mp4``。
+**先有视频底**。本技能就是那个第 1 步——**逐镜**把素材图 + **画面提示词**喂给图生视频模型，产出**真视频片段**，
+落 ``{cachePrefix}/{runId}/clips/{shotId}.mp4``。
+
+**prompt 取画面提示词、不是台词**（ADR-073）：把口播文案当画面提示词会让模型把**字幕烧进画面**，
+故优先用 ``edl.shots[].visualPrompt``（``copy`` 只在缺画面提示词时兜底，并**如实告警**）。
 
 链路位置：``timeline``（锁时长）→ **本步** → ``render`` 侧对片段加运镜并拼成成片。
 
@@ -31,9 +34,15 @@ from flowmind.skills._dsp_common import DspBaseInput
 
 _VERSION = "0.1.0"
 
+# 负向约束（ADR-073；依据厂商《Seedance 2.5 提示词指南》「字幕约束不生效」一节）：
+# 台词被写进 prompt 时模型容易把字幕**烧进画面**——除画面提示词本身不写台词外，这里再兜一层明文禁止。
+# 需要更强的负向约束时经 env ``FLOWMIND_DSP_VIDEOGEN_PROMPT_SUFFIX``（``DspConfig.videogen_prompt_suffix``）追加。
+_PROMPT_NEGATIVE = "。画面中不要出现任何文字、字幕、水印、logo 或品牌标识。"
+
 
 class ImageToVideoInput(DspBaseInput):
-    """图生视频入参（公共上下文已含 ``shots[]``——文案取自其 ``copy``）。"""
+    """图生视频入参（公共上下文已含 ``shots[]``——逐镜的**画面提示词**取自其 ``visualPrompt``，
+    缺则回落 ``copy`` 口播文案并如实告警，见 ADR-073）。"""
 
     maxShots: int = Field(
         default=0, ge=0,
@@ -81,8 +90,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             "missing-timeline", "缺少锁定时间线（deps.timeline.edl）",
             "图生视频按锁定时间线的镜头与时长出片；请先跑通 timeline。")
     if not inp.shots:
-        return _degraded("no-shots", "入参无 shots[]（缺文案来源）",
-                         "图生视频的 prompt 取自镜头文案；无 shots 即无可生成的镜头。")
+        return _degraded("no-shots", "入参无 shots[]（缺画面提示词来源）",
+                         "图生视频的 prompt 取自镜头的画面提示词（缺则回落文案）；无 shots 即无可生成的镜头。")
     if not videogen.videogen_configured(cfg):
         return _degraded(
             "videogen-not-configured",
@@ -90,27 +99,39 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             "开启「图生视频」开关即需配置该密钥；未配置时如实降级，绝不伪造片段。")
 
     warnings: list[str] = []
-    # 文案**从 EDL 读**（ADR-070）：镜头在 timeline 里经收口（并/拆）后 id 会重排为 `s1..sK`，
-    # 终版镜头的文案已随镜落进 `edl.shots[].copy`——回查 inp.shots 会**错配**。
-    # 兜底：EDL 无文案（旧快照）时按 id 回查下发的 shots（尽力而为，不臆造）。
+    # 文案 / 画面提示词**从 EDL 读**（ADR-070/073）：镜头在 timeline 里经收口（并/拆）后 id 会重排为
+    # `s1..sK`，终版镜头的文案与画面提示词已随镜落进 `edl.shots[]`——回查 inp.shots 会**错配**。
+    # 兜底：EDL 无该字段（旧快照）时按 id 回查下发的 shots（尽力而为，不臆造）。
     copy_by_shot = {s.id: s.copy_text for s in inp.shots}
+    visual_by_shot = {s.id: s.visualPrompt for s in inp.shots}
 
-    # ── 组作业：逐镜（图 + 文案 + 建议时长）──
+    # ── 组作业：逐镜（图 + 画面提示词 + 建议时长）──
     jobs: list[tuple[str, int, int, str, str, str]] = []
+    fell_back = 0
     for shot in edl.shots:
         if not shot.imageSourceKey:
             warnings.append(f"镜头 {shot.id} 无图（timeline 已留空位）——跳过图生视频")
             continue
-        prompt = (shot.copy or copy_by_shot.get(shot.id) or "").strip()
+        # **画面提示词优先**（ADR-073）：把**台词**当画面提示词会让模型把字幕烧进画面，
+        # 故顺序是 visualPrompt（EDL → 下发 shots）→ copy 兜底，并对兜底**如实计数**。
+        visual = (shot.visualPrompt or visual_by_shot.get(shot.id, "")).strip()
+        fallback_copy = (shot.copy or copy_by_shot.get(shot.id, "")).strip()
+        prompt = visual or fallback_copy
         if not prompt:
-            warnings.append(f"镜头 {shot.id} 无文案（prompt 为空）——跳过图生视频（不凭空编 prompt）")
+            warnings.append(f"镜头 {shot.id} 无画面提示词也无文案（prompt 为空）——跳过图生视频（不凭空编 prompt）")
             continue
+        if not visual:
+            fell_back += 1
         jobs.append((
             shot.id, shot.atMs, shot.durationMs,
-            prompt + cfg.videogen_prompt_suffix,
+            prompt + _PROMPT_NEGATIVE + cfg.videogen_prompt_suffix,
             shot.imageSourceKey,
             videogen.seconds_str(shot.durationMs),
         ))
+    if fell_back:
+        warnings.append(
+            f"{fell_back} 个镜头没有画面提示词（visualPrompt），已**回落用口播文案**出 prompt——"
+            "台词容易被模型画成画面字幕，建议在镜头剪辑页为这些镜补画面提示词（ADR-073）。")
     if inp.maxShots and len(jobs) > inp.maxShots:
         warnings.append(f"超过 maxShots={inp.maxShots}：仅生成前 {inp.maxShots} 镜（其余回落静图）")
         jobs = jobs[:inp.maxShots]
@@ -163,7 +184,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         reasoning=[common.chain(
             f"图生视频完成：{len(clips)}/{len(jobs)} 镜出片（共 {total_ms}ms）",
             causal_analysis=(
-                f"逐镜把素材图（预签名 URL）+ 镜头文案喂 {cfg.videogen_model}；"
+                f"逐镜把素材图（预签名 URL）+ **画面提示词**喂 {cfg.videogen_model}（prompt 末尾统一追加"
+                "「不要出现文字/字幕/水印」的负向约束，ADR-073）；"
                 f"时长按镜头建议时长（{clips[0].durationMs}ms 等）原样下发；"
                 "直链（24h）已转存为不可变 key。"
             ),

@@ -155,6 +155,7 @@ def _cut_shots(inp: TimelineBuildInput) -> list[align.CutShot]:
         align.CutShot(
             id=s.id,
             copy=s.copy_text,
+            visual_prompt=s.visualPrompt,
             need_kind=s.needKind,
             clip_keys=tuple(s.clipKeys),
             camera_motion=bool(s.cameraMotion),
@@ -290,6 +291,7 @@ def timeline_build(inp: TimelineBuildInput) -> SkillOutput[TimelineBuildData]:
             durationMs=span.durationMs,
             imageSourceKey=source_key,
             copy=shot.copy,
+            visualPrompt=shot.visual_prompt,
             needKind=shot.need_kind,
         ))
 

@@ -5,6 +5,7 @@
 展示：
 1. discover() 自动字段发现
 2. happy path：deps.tts.voSegments 逐句 → SRT 文件 + 逐条字幕
+2b. **词级 SRT**（ADR-073）：厂商带 `words[]` → **另出**一份词级 SRT（供导出/二次剪辑，不参与烧制）
 3. 时间点越界 → **如实报出、不夹取**（warnings）
 4. 无配音时间戳 → 如实降级（不伪造字幕）
 
@@ -76,6 +77,26 @@ def main() -> None:
     check("00:00:02,900 --> 00:00:03,000" not in _WRITTEN[d.srtKey], "时间戳格式应正确")
     check("00:00:00,000 --> 00:00:02,900" in _WRITTEN[d.srtKey], "第一条 0→2.9s")
     check(d.warnings == [], "正常时间点不应有越界告警")
+    check(d.wordsSrtKey == "", "厂商未给词级 token ⇒ 不出词级 SRT（不拿句级冒充，ADR-073）")
+
+    section("2b) 词级 SRT（ADR-073）：带 words[] → 另出一份词级字幕（不参与烧制）")
+    _WRITTEN.clear()
+    r = invoke("subtitle_build", _ctx(_edl(9000) | {"tts": {"voSegments": [
+        {"id": "s1", "atMs": 0, "durationMs": 2000, "text": "开门的瞬间",
+         "words": [{"atMs": 0, "durationMs": 900, "text": "开门"},
+                   {"atMs": 900, "durationMs": 1100, "text": "的瞬间"}]},
+    ]}}))
+    d = r.data
+    print(f"  srtKey      : {d.srtKey}")
+    print(f"  wordsSrtKey : {d.wordsSrtKey}")
+    print("  词级 SRT 片段：")
+    for line in _WRITTEN[d.wordsSrtKey].strip().splitlines()[:4]:
+        print(f"    | {line}")
+    check(d.srtKey in _WRITTEN and d.wordsSrtKey in _WRITTEN, "两份 SRT 都须落对象存储")
+    check(d.wordsSrtKey != d.srtKey, "词级与句级是两个文件（烧制口径不变）")
+    check(len(d.subtitles) == 1, "句级仍是 1 条（烧制口径不受影响）")
+    check("00:00:00,900 --> 00:00:02,000" in _WRITTEN[d.wordsSrtKey], "词级第 2 条 0.9→2.0s")
+    check("开门" in _WRITTEN[d.wordsSrtKey] and "的瞬间" in _WRITTEN[d.wordsSrtKey], "词级逐词成条")
 
     section("2) 时间点越界 → 如实报出、不夹取")
     r = invoke("subtitle_build", _ctx(_edl(5000) | {"tts": {"voSegments": [

@@ -78,7 +78,9 @@ def _edl() -> dict:
         ],
         "shots": [
             {"id": "s1", "atMs": 0, "durationMs": 3000,
-             "imageSourceKey": "dsp/scratch/t1/门店/门头1.jpg"},
+             "imageSourceKey": "dsp/scratch/t1/门店/门头1.jpg",
+             # ADR-073：s1 带**画面提示词**（主路径），s2 刻意不给（走 copy 兜底 + 如实告警）
+             "visualPrompt": "中景，平视，固定机位；店员弯腰拉起卷帘门，晨光斜射进门头；写实拍摄质感"},
             {"id": "s2", "atMs": 3000, "durationMs": 4000,
              "imageSourceKey": "dsp/scratch/t1/产品/杯1.jpg"},
         ],
@@ -120,7 +122,14 @@ def main() -> None:
     check(len(r.data.clips) == 2, "两镜都应出片")
     check(_SUBMITTED[0]["seconds"] == "3" and _SUBMITTED[1]["seconds"] == "4",
           "秒数按镜头时长下发（3000ms→'3' / 4000ms→'4'）")
-    check(_SUBMITTED[0]["prompt"] == "早上七点，卷帘门刚拉起", "prompt 取自镜头文案")
+    # ADR-073：prompt 取**画面提示词**（不是台词）；末尾统一追加负向约束（禁文字/字幕/水印）
+    check(_SUBMITTED[0]["prompt"].startswith("中景，平视，固定机位"),
+          "prompt 取画面提示词（visualPrompt），不是口播文案")
+    check("不要出现任何文字" in _SUBMITTED[0]["prompt"], "prompt 末尾须带负向约束（禁文字/字幕/水印）")
+    check(_SUBMITTED[1]["prompt"].startswith("这杯保温 12 小时"),
+          "无画面提示词的镜**回落用文案**出 prompt（如实兜底）")
+    check(any("没有画面提示词" in w and "回落" in w for w in r.data.warnings),
+          "回落用文案出 prompt 须**如实告警**（ADR-073）")
     check(_SUBMITTED[0]["image_url"] == "https://assets.example/dsp/scratch/t1/门店/门头1.jpg",
           "素材须经预签名 URL 供厂商拉取")
     check("dsp/scratch/t1/run-demo-8/clips/s1.mp4" in _PUTS, "直链须转存为不可变 key")

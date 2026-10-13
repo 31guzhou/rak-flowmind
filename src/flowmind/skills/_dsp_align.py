@@ -428,6 +428,10 @@ class CutShot:
     need_kind: str = ""
     clip_keys: tuple[str, ...] = ()
     camera_motion: bool = False
+    """该镜的**画面提示词**（ADR-073；与 ``copy`` 口播文案分开）——喂图生视频模型的画面描述。
+    **并镜 = 各镜画面描述按行拼接；拆镜 = 两半共用**（同一画面意图）。下游 ``image_to_video``
+    优先用它出 prompt，缺则回落 ``copy`` 并如实告警。"""
+    visual_prompt: str = ""
     """该镜**末尾**的转场覆盖（符号名；None = 硬切）。**只作用于该镜末尾**——若该镜被拆成两半，
     内部那刀按硬切，用户设的转场保留在**整镜末尾**（ADR-070）。"""
     transition_after: str | None = None
@@ -516,6 +520,10 @@ def consolidate_shots(
         # 主导成员 = 实测最长的那一镜（决定类目与运镜；并镜后仍要有个明确的画面意图）
         dominant = max(group, key=lambda j: spans[j].durationMs)
         copy = "".join(shots[j].copy for j in group)
+        # 画面提示词（ADR-073）：并镜 = 各镜画面描述**按行拼接**（跳过空串）；拆镜时两半共用 base，自然继承
+        visual_prompt = "\n".join(
+            v for j in group if (v := shots[j].visual_prompt.strip())
+        )
         clip_keys: list[str] = []
         for j in group:
             for key in shots[j].clip_keys:
@@ -524,6 +532,7 @@ def consolidate_shots(
         base = CutShot(
             id="",  # 收尾统一重排
             copy=copy,
+            visual_prompt=visual_prompt,
             need_kind=shots[dominant].need_kind,
             clip_keys=tuple(clip_keys),
             camera_motion=shots[dominant].camera_motion,

@@ -248,7 +248,7 @@ def main() -> None:
     section("8b) 收口 · 拆镜**下沉到词边界**：整镜就是一整句且超长（句内无句边界）→ 切词")
     shots_word = [
         {"id": "s1", "label": "长句一镜", "needKind": "门头", "durationMs": 8000,
-         "copy": "开门的瞬间保温十二小时"},
+         "copy": "开门的瞬间保温十二小时", "visualPrompt": "长句一镜的画面描述"},
         {"id": "s2", "label": "人物", "needKind": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
     ]
     r = invoke("timeline_build", _ctx(shots=shots_word, deps={"tts": _seg([
@@ -268,6 +268,28 @@ def main() -> None:
           "词级拆出的两道边界都按硬切（未设转场）")
     check(any("下沉到词边界" in n for n in d.notes),
           "词级下沉须如实说明（该处切在句内、非句边界）")
+    check(d.edl.shots[0].visualPrompt == d.edl.shots[1].visualPrompt == "长句一镜的画面描述",
+          "拆镜：两半**共用**同一画面提示词（ADR-073）")
+
+    section("9b) 画面提示词（ADR-073）：并镜按行拼接、随 EDL 透出给 image_to_video")
+    shots_vp = [
+        {"id": "s1", "label": "门头", "needKind": "门头", "durationMs": 1000,
+         "copy": "开门", "visualPrompt": "A 画面：门头晨光"},
+        {"id": "s2", "label": "产品", "needKind": "产品", "durationMs": 1000,
+         "copy": "保温", "visualPrompt": "B 画面：杯身特写"},
+        {"id": "s3", "label": "人物", "needKind": "人物", "durationMs": 2000,
+         "copy": "上班族", "visualPrompt": "C 画面：通勤人流"},
+    ]
+    r = invoke("timeline_build", _ctx(shots=shots_vp, deps={"tts": _seg([
+        (0, 1000, "开门"), (1000, 2000, "保温"), (2000, 4000, "上班族"),
+    ])}))
+    check(r.ok, "画面提示词路径应 ok")
+    d = r.data
+    _dump(d)
+    check(len(d.edl.shots) == 2, "两个 1s 镜实测 < 1.5s 并入后共 2 镜")
+    check(d.edl.shots[0].visualPrompt == "A 画面：门头晨光\nB 画面：杯身特写",
+          "并镜：画面提示词**按行拼接**（不丢、不臆造）")
+    check(d.edl.shots[1].visualPrompt == "C 画面：通勤人流", "未并镜的镜原样透出")
 
     section("9) 转场：非拆分边界上的符号值原样落 EDL（厂商 ID 未登记 ⇒ render 侧回落硬切）")
     shots_tr = [

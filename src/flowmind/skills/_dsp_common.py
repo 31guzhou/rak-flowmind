@@ -60,6 +60,15 @@ def subtitle_key(cache_prefix: str, run_id: str) -> str:
     return _join(cache_prefix, run_id, "subtitle", "captions.srt")
 
 
+def words_subtitle_key(cache_prefix: str, run_id: str) -> str:
+    """**词级** SRT 的 key（ADR-073）——与句级 SRT 并列落同一字幕夹。
+
+    用途：**导出 / 二次剪辑**（平台跟读字幕）。**不参与烧制**——烧制仍用句级 SRT
+    （既有轨数约束不变，见契约 §3.4）。厂商未给词级 token 时本文件不生成。
+    """
+    return _join(cache_prefix, run_id, "subtitle", "captions.words.srt")
+
+
 def final_key(output_prefix: str, run_id: str, ext: str = "mp4") -> str:
     """成片的 key（§2.4；本仓就取这个 key 当成品）。"""
     return _join(output_prefix, run_id, f"final.{ext}")
@@ -88,6 +97,11 @@ class DspShot(BaseModel):
         description="镜头**估算**时长（ms，前端按文案字数算）——ADR-069：仅「无配音」时的兜底；"
                     "有配音时真实时长由 `timeline` 按逐句实测锁定，本值被覆盖")
     copy_text: str = Field(default="", alias="copy")
+    visualPrompt: str = Field(
+        default="",
+        description="该镜的**画面提示词**（ADR-073；与 `copy` 口播文案**分开**）——喂图生视频模型的"
+                    "**画面描述**（主体 + 动作 + 环境光线 + 景别机位 + 风格），**不是台词**。"
+                    "空串 = 未给 ⇒ 下游回落用 `copy` 出 prompt 并**如实告警**（绝不假装有画面提示词）")
     clipKeys: list[str] = Field(default_factory=list, description="指名的图片 key（优先于 needKind 选图）")
     cameraMotion: bool = Field(default=False, description="运镜（Ken Burns）：落 EDL segment 的 effect")
     transitionAfter: str | None = Field(
@@ -167,6 +181,10 @@ class DspEdlShot(BaseModel):
     durationMs: int
     imageSourceKey: str = ""
     copy: str = Field(default="", description="**该终版镜头**的口播文案（并镜=拼接、拆镜=该半段）；下游据此出提示词")
+    visualPrompt: str = Field(
+        default="",
+        description="**该终版镜头**的**画面提示词**（ADR-073；并镜=按行拼接、拆镜=两半共用）。"
+                    "`image_to_video` 优先用它出 prompt，缺则回落 `copy` 并如实告警")
     needKind: str = Field(default="", description="该终版镜头需要的图片类目（并镜取其一，仅供诊断）")
 
 
