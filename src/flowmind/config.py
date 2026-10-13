@@ -481,6 +481,17 @@ class DspConfig(BaseModel):
         default="standard", validate_default=True)  # standard | high
     videogen_max_ref_images: int = 9        # 文档：seedance 系列参考图 ≤ 9 张
     videogen_prompt_suffix: str = ""        # 逐镜 prompt 后缀（如统一加「运镜」提示）
+    # ── 首尾帧桥（ADR-074；env FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE=0 关）──
+    # 逐镜把**下一镜的图**当**尾帧**下发（放 ``images`` 数组第 2 位），让相邻镜在画面里首尾咬合
+    # ——这是「厂商转场资源 ID 未登记 ⇒ 一律硬切」的**更根本解法**（不依赖资源 ID 登记）。
+    # ⚠️ 聚合商请求字段里**没有**指南首尾帧用的 ``content.role``——本实现是**该接口面上最接近的落法**，
+    #    语义**待真跑验证**；若聚合商按「多参考图」处理，效果退化为**无桥**（不产生错误画面）。
+    videogen_bridge_next_image: bool = Field(default=True, validate_default=True)
+    # ── 下发前按输出分辨率降采样（ADR-074；env FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT=0 关）──
+    # 指南 FAQ：「输入图片**不超过输出视频分辨率**」（超标画面易出指纹状纹理；输出 1080p 概率低于 720p）。
+    # 素材图（补生 ``1152x2048``）是**静图主轨**口径（长边 ≥2048，缩到画布才不虚）——与 I2V 输入是
+    # **同一张图的两个用途**，故在**输入侧**等比缩到 ``videogen_size`` 以内，**不动补生尺寸常量**。
+    videogen_downscale_input: bool = Field(default=True, validate_default=True)
 
     @field_validator(*_DSP_ENV_FIELDS, mode="before")
     @classmethod
@@ -500,6 +511,22 @@ class DspConfig(BaseModel):
             return False
         if raw in ("1", "true", "yes"):
             return True
+        return v
+
+    @field_validator("videogen_bridge_next_image", "videogen_downscale_input", mode="before")
+    @classmethod
+    def _env_videogen_flags(cls, v: bool, info: ValidationInfo) -> bool:
+        """两个 I2V 行为开关的 env 覆盖（1/true/yes 开，0/false/no 关；其余不生效）。"""
+        ensure_env_loaded()
+        env_names = {
+            "videogen_bridge_next_image": "FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE",
+            "videogen_downscale_input": "FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT",
+        }
+        raw = os.environ.get(env_names[info.field_name], "").strip().lower()
+        if raw in ("1", "true", "yes"):
+            return True
+        if raw in ("0", "false", "no"):
+            return False
         return v
 
 

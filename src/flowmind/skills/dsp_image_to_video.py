@@ -7,6 +7,16 @@
 **prompt 取画面提示词、不是台词**（ADR-073）：把口播文案当画面提示词会让模型把**字幕烧进画面**，
 故优先用 ``edl.shots[].visualPrompt``（``copy`` 只在缺画面提示词时兜底，并**如实告警**）。
 
+**首尾帧桥**（ADR-074）：逐镜把**下一镜的图**当**尾帧**下发（``images`` 数组第 2 位）——
+相邻镜在画面里首尾咬合，取代「厂商转场资源 ID 未登记 ⇒ 一律硬切」。开关
+``FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE=0`` 可关（聚合商未透出指南的 ``content.role``，
+本落法语义**待真跑验证**）。
+
+**输入降采样**（ADR-074）：素材图（补生 ``1152x2048``，为**静图主轨**口径）在**下发前**等比缩到
+不超过 I2V 输出分辨率（``videogen_size``）——指南 FAQ：输入超过输出分辨率易出**指纹状纹理**。
+只缩不放；降采样失败**回落原图并如实告警**（画质风险，不是成片失败）。
+开关 ``FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT=0`` 可关。
+
 链路位置：``timeline``（锁时长）→ **本步** → ``render`` 侧对片段加运镜并拼成成片。
 
 粒度与时长：**一镜一段**；镜头建议时长（``shots[].durationMs``）按秒下发给模型
@@ -19,17 +29,20 @@
 """
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 from pydantic import BaseModel, Field
 
-from flowmind.config import load_config
+from flowmind.config import DspConfig, load_config
 from flowmind.contracts import SkillOutput
 from flowmind.skill import skill
 from flowmind.skills import _dsp_common as common
 from flowmind.skills import _dsp_storage as storage
 from flowmind.skills import _dsp_video_gen as videogen
+from flowmind.skills import _media as media
 from flowmind.skills._dsp_common import DspBaseInput
 
 _VERSION = "0.1.0"
@@ -38,6 +51,10 @@ _VERSION = "0.1.0"
 # 台词被写进 prompt 时模型容易把字幕**烧进画面**——除画面提示词本身不写台词外，这里再兜一层明文禁止。
 # 需要更强的负向约束时经 env ``FLOWMIND_DSP_VIDEOGEN_PROMPT_SUFFIX``（``DspConfig.videogen_prompt_suffix``）追加。
 _PROMPT_NEGATIVE = "。画面中不要出现任何文字、字幕、水印、logo 或品牌标识。"
+
+# 降采样派生件的**文件夹**（在 run 的工作缓存目录内）与**可选后缀**（认不出即按 JPEG）。
+_I2V_INPUT_DIR = "i2v_input"
+_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
 
 class ImageToVideoInput(DspBaseInput):
@@ -63,9 +80,82 @@ class ImageToVideoData(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class _Job(NamedTuple):
+    """一镜的图生视频作业（尾帧 = 下一镜的图；空串 = 无桥）。"""
+    shot_id: str
+    at_ms: int
+    duration_ms: int
+    prompt: str
+    image_key: str
+    tail_key: str
+    seconds: str
+
+
 def _presign(key: str) -> str:
     """素材 key → 预签名 URL（图生视频要公网可达的图；空 key 返回空串）。"""
     return storage.presign_get(key) if key else ""
+
+
+def _next_image_key(shots: list[common.DspEdlShot], idx: int) -> str:
+    """本镜之后**最近一张有图的镜**的素材 key（首尾帧桥的尾帧；没有则空串）。
+
+    取「最近的有图镜」而非「紧邻镜」：中间镜无图时桥不该断（尾帧仍是下一张会出画的图）。
+    """
+    for nxt in shots[idx + 1:]:
+        if nxt.imageSourceKey:
+            return nxt.imageSourceKey
+    return ""
+
+
+def _i2v_image_url(
+    inp: ImageToVideoInput, cfg: DspConfig, key: str, cap: tuple[int, int],
+    cache: dict[str, str], warnings: list[str], stats: dict[str, int],
+) -> str:
+    """素材 key → 下发用预签名 URL；超 ``cap`` 先等比降采样（ADR-074）。取不到 URL 返回空串。
+
+    同一素材 key **只准备一次**（首尾帧桥下相邻镜会共用同一张图）；降采样失败**回落原图**
+    并如实告警——画质风险，不是成片失败，不因此丢掉整镜。
+    """
+    if key in cache:
+        return cache[key]
+    try:
+        src_url = _presign(key)
+    except storage.DspStorageError as exc:
+        warnings.append(f"素材 {Path(key).name} 无法预签名（{exc}）——跳过该镜图生视频")
+        cache[key] = ""
+        return ""
+    if not (cap[0] and cap[1]):
+        cache[key] = src_url
+        return src_url
+
+    suffix = Path(key).suffix.lower()
+    out_suffix = suffix if suffix in _IMAGE_SUFFIXES else ".jpg"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    derived_key = common.step_key(
+        inp.cachePrefix, inp.runId, _I2V_INPUT_DIR,
+        f"{Path(key).stem[:24]}-{digest}{out_suffix}")
+    try:
+        with tempfile.TemporaryDirectory(prefix="dsp-i2v-in-") as tmp:
+            src = storage.fetch_to_file(src_url, str(Path(tmp) / f"orig{suffix or out_suffix}"))
+            w, h = media.probe_image_size(src)
+            if w <= cap[0] and h <= cap[1]:
+                cache[key] = src_url           # 已不超 ⇒ 原图直用，不落派生件
+                return src_url
+            fitted = media.scale_image_to_fit(src, str(Path(tmp) / f"fit{out_suffix}"), *cap)
+            storage.put_file(fitted, derived_key,
+                             content_type=storage.content_type_for(derived_key))
+    except (media.MediaError, storage.DspStorageError) as exc:
+        warnings.append(
+            f"素材 {Path(key).name} 降采样失败（{exc}）——**回落原图下发**"
+            f"（指南：输入**超过输出分辨率** {cap[0]}x{cap[1]} 易出指纹状纹理；本镜未能核实尺寸，"
+            "画质可能受影响）")
+        cache[key] = src_url
+        return src_url
+
+    stats["downscaled"] += 1
+    url = _presign(derived_key)
+    cache[key] = url
+    return url
 
 
 def _degraded(reason: str, note: str, risk: str) -> SkillOutput[ImageToVideoData]:
@@ -105,10 +195,19 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     copy_by_shot = {s.id: s.copy_text for s in inp.shots}
     visual_by_shot = {s.id: s.visualPrompt for s in inp.shots}
 
-    # ── 组作业：逐镜（图 + 画面提示词 + 建议时长）──
-    jobs: list[tuple[str, int, int, str, str, str]] = []
+    # 输入降采样上限 = I2V **输出**分辨率（ADR-074；形状不合法即跳过降采样并如实说明）。
+    cap = (0, 0)
+    if cfg.videogen_downscale_input:
+        cap = videogen.parse_size(cfg.videogen_size)
+        if not (cap[0] and cap[1]):
+            warnings.append(
+                f"视频尺寸 {cfg.videogen_size!r} 形状不合法——**跳过输入降采样**（原图下发）")
+
+    # ── 组作业：逐镜（图 + 画面提示词 + 建议时长 + 下一镜的图当尾帧）──
+    shots = list(edl.shots)
+    jobs: list[_Job] = []
     fell_back = 0
-    for shot in edl.shots:
+    for idx, shot in enumerate(shots):
         if not shot.imageSourceKey:
             warnings.append(f"镜头 {shot.id} 无图（timeline 已留空位）——跳过图生视频")
             continue
@@ -122,11 +221,12 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             continue
         if not visual:
             fell_back += 1
-        jobs.append((
-            shot.id, shot.atMs, shot.durationMs,
-            prompt + _PROMPT_NEGATIVE + cfg.videogen_prompt_suffix,
-            shot.imageSourceKey,
-            videogen.seconds_str(shot.durationMs),
+        tail_key = _next_image_key(shots, idx) if cfg.videogen_bridge_next_image else ""
+        jobs.append(_Job(
+            shot_id=shot.id, at_ms=shot.atMs, duration_ms=shot.durationMs,
+            prompt=prompt + _PROMPT_NEGATIVE + cfg.videogen_prompt_suffix,
+            image_key=shot.imageSourceKey, tail_key=tail_key,
+            seconds=videogen.seconds_str(shot.durationMs),
         ))
     if fell_back:
         warnings.append(
@@ -143,32 +243,40 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             confidence=0.0, degraded=True, degradation_reason="no-generatable-shots")
 
     # ── 先全部提交（厂商侧并行跑），再逐个等 ──
-    submitted: list[tuple[tuple[str, int, int, str, str, str], str]] = []
+    # 素材图在这时才逐张准备（降采样要下载+缩放+转存，只对**真要生成的镜**做）。
+    url_cache: dict[str, str] = {}
+    stats = {"downscaled": 0}
+    submitted: list[tuple[_Job, str]] = []
     for job in jobs:
-        shot_id, _at, _dur, prompt, image_key, seconds = job
+        image_url = _i2v_image_url(inp, cfg, job.image_key, cap, url_cache, warnings, stats)
+        if not image_url:
+            continue
+        tail_url = (_i2v_image_url(inp, cfg, job.tail_key, cap, url_cache, warnings, stats)
+                    if job.tail_key else "")
         try:
             task_id = videogen.submit(
-                cfg, prompt=prompt, image_url=_presign(image_key), seconds=seconds)
+                cfg, prompt=job.prompt, image_url=image_url,
+                seconds=job.seconds, tail_image_url=tail_url)
         except videogen.DspVideoGenError as exc:
-            warnings.append(f"镜头 {shot_id} 提交失败（{exc.category}）：{exc}——该镜回落静图")
+            warnings.append(f"镜头 {job.shot_id} 提交失败（{exc.category}）：{exc}——该镜回落静图")
             continue
         submitted.append((job, task_id))
 
     # ── 收片 → 转存（文档：直链临时保存 24h，绝不当 key）──
     clips: list[ShotClip] = []
     for job, task_id in submitted:
-        shot_id, at_ms, duration_ms, _prompt, _img, _sec = job
         try:
             raw = videogen.wait(cfg, task_id)
             url = videogen.result_url(raw)
-            key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{shot_id}.mp4")
+            key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
             with tempfile.TemporaryDirectory(prefix="dsp-i2v-") as tmp:
-                local = storage.fetch_to_file(url, str(Path(tmp) / f"{shot_id}.mp4"))
+                local = storage.fetch_to_file(url, str(Path(tmp) / f"{job.shot_id}.mp4"))
                 storage.put_file(local, key, content_type="video/mp4")
         except (videogen.DspVideoGenError, storage.DspStorageError) as exc:
-            warnings.append(f"镜头 {shot_id} 出片/转存失败：{exc}——该镜回落静图")
+            warnings.append(f"镜头 {job.shot_id} 出片/转存失败：{exc}——该镜回落静图")
             continue
-        clips.append(ShotClip(shotId=shot_id, key=key, atMs=at_ms, durationMs=duration_ms))
+        clips.append(ShotClip(shotId=job.shot_id, key=key, atMs=job.at_ms,
+                              durationMs=job.duration_ms))
 
     failed = len(jobs) - len(clips)
     if not clips:
@@ -179,15 +287,24 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             confidence=0.0, degraded=True, degradation_reason="all-shots-failed")
 
     total_ms = sum(c.durationMs for c in clips)
+    bridged = sum(1 for j in jobs if j.tail_key)
+    extras = ([f"首尾帧桥 {bridged} 镜"] if bridged else []) + (
+        [f"输入降采样 {stats['downscaled']} 张"] if stats["downscaled"] else [])
     return SkillOutput(
         data=ImageToVideoData(clips=clips, warnings=warnings),
         reasoning=[common.chain(
-            f"图生视频完成：{len(clips)}/{len(jobs)} 镜出片（共 {total_ms}ms）",
+            f"图生视频完成：{len(clips)}/{len(jobs)} 镜出片（共 {total_ms}ms"
+            f"{'；' + '，'.join(extras) if extras else ''}）",
             causal_analysis=(
                 f"逐镜把素材图（预签名 URL）+ **画面提示词**喂 {cfg.videogen_model}（prompt 末尾统一追加"
                 "「不要出现文字/字幕/水印」的负向约束，ADR-073）；"
                 f"时长按镜头建议时长（{clips[0].durationMs}ms 等）原样下发；"
-                "直链（24h）已转存为不可变 key。"
+                + ("相邻镜按**首尾帧桥**下发（首帧 = 本镜图、尾帧 = 下一镜图，ADR-074），"
+                   "让切点处画面首尾咬合；" if bridged else "")
+                + (f"素材图超输出分辨率（{cfg.videogen_size}）的先**等比降采样**再下发"
+                   f"（指南：输入超标易出指纹状纹理，ADR-074），共 {stats['downscaled']} 张；"
+                   if stats["downscaled"] else "")
+                + "直链（24h）已转存为不可变 key。"
             ),
             risk_note=(
                 f"{failed} 镜未出片，render 侧将回落静图（如实标注）。"

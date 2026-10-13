@@ -17,6 +17,9 @@ MediaKit（渲染）、豆包语音（配音）**不共享端点与密钥**—�
 
 ⚠️ **``seconds`` 取值「视模型而定」**（文档原话），**不保证连续整数**。本实现照
 镜头建议时长**原样下发**；厂商拒绝即抛结构化错误（不偷偷夹取 / 不编造时长）。
+
+⚠️ 聚合商请求字段里**没有**指南首尾帧用的 ``content.role``——本仓把**尾帧**放 ``images``
+数组第 2 位当「首尾帧桥」（ADR-074），这是**该接口面上最接近的落法**，语义**待真跑验证**。
 """
 from __future__ import annotations
 
@@ -103,8 +106,26 @@ def seconds_str(ms: int) -> str:
     return str(int(value)) if value == int(value) else f"{value:.1f}"
 
 
-def build_payload(cfg: DspConfig, *, prompt: str, image_url: str, seconds: str) -> dict:
-    """按文档组装提交体（``image`` 单图 URL + ``images`` 数组，文档称前者兼容旧客户端）。"""
+def parse_size(size: str) -> tuple[int, int]:
+    """``"720x1280"`` → ``(720, 1280)``；形状不对返回 ``(0, 0)``（调用方据此**跳过**降采样）。"""
+    parts = (size or "").lower().split("x")
+    if len(parts) != 2:
+        return 0, 0
+    try:
+        w, h = int(parts[0]), int(parts[1])
+    except ValueError:
+        return 0, 0
+    return (w, h) if w > 0 and h > 0 else (0, 0)
+
+
+def build_payload(
+    cfg: DspConfig, *, prompt: str, image_url: str, seconds: str, tail_image_url: str = "",
+) -> dict:
+    """按文档组装提交体（``image`` 单图 URL + ``images`` 数组，文档称前者兼容旧客户端）。
+
+    ``tail_image_url`` 非空时放进 ``images`` 第 2 位 = **首尾帧桥**（ADR-074）：
+    首帧 = 本镜图、尾帧 = 下一镜图 ⇒ 相邻镜在画面里首尾咬合。空串 = 现状（单图）。
+    """
     payload: dict = {
         "model": cfg.videogen_model,
         "prompt": prompt,
@@ -115,12 +136,17 @@ def build_payload(cfg: DspConfig, *, prompt: str, image_url: str, seconds: str) 
     }
     if image_url:
         # 文档：``image`` = 单图 URL（兼容旧客户端）；``images`` = URL 数组（≤9 张）
+        refs = [image_url]
+        if tail_image_url and tail_image_url != image_url:
+            refs.append(tail_image_url)
         payload["image"] = image_url
-        payload["images"] = [image_url][: max(1, cfg.videogen_max_ref_images)]
+        payload["images"] = refs[: max(1, cfg.videogen_max_ref_images)]
     return payload
 
 
-def submit(cfg: DspConfig, *, prompt: str, image_url: str, seconds: str) -> str:
+def submit(
+    cfg: DspConfig, *, prompt: str, image_url: str, seconds: str, tail_image_url: str = "",
+) -> str:
     """提交图生视频任务，返回 ``task_id``（文档：读 ``id`` / ``task_id``）。"""
     api_key = get_api_key(cfg.videogen_key_env)
     if not api_key:
@@ -131,7 +157,8 @@ def submit(cfg: DspConfig, *, prompt: str, image_url: str, seconds: str) -> str:
         raise DspVideoGenError("图生视频需要 prompt（镜头文案为空）。", category="video")
 
     url = cfg.videogen_api_base.rstrip("/") + cfg.videogen_submit_path
-    payload = build_payload(cfg, prompt=prompt, image_url=image_url, seconds=seconds)
+    payload = build_payload(
+        cfg, prompt=prompt, image_url=image_url, seconds=seconds, tail_image_url=tail_image_url)
     try:
         resp = requests.post(url, json=payload, headers=_headers(cfg, api_key),
                              timeout=cfg.videogen_timeout_s)
@@ -225,9 +252,12 @@ def wait(cfg: DspConfig, task_id: str, *, api_key: str = "") -> dict:
         time.sleep(cfg.videogen_poll_interval_s)
 
 
-def generate(cfg: DspConfig, *, prompt: str, image_url: str, seconds: str) -> dict:
+def generate(
+    cfg: DspConfig, *, prompt: str, image_url: str, seconds: str, tail_image_url: str = "",
+) -> dict:
     """提交 + 轮询至完成，返回 ``{task_id, url, ...}``（薄适配层：demo 直接替换本函数）。"""
     api_key = get_api_key(cfg.videogen_key_env)
-    task_id = submit(cfg, prompt=prompt, image_url=image_url, seconds=seconds)
+    task_id = submit(
+        cfg, prompt=prompt, image_url=image_url, seconds=seconds, tail_image_url=tail_image_url)
     raw = wait(cfg, task_id, api_key=api_key)
     return {"task_id": task_id, "url": result_url(raw), "raw": raw}

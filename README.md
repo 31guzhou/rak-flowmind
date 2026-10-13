@@ -96,9 +96,19 @@
 > 硬切并告警**，**绝不编造 ID**；拿到 ID 表后只填那一张表。
 
 > **图生视频（`image_to_video`）**：运镜 `apply-camera-motion` **只接受视频**，故「让静态图
-> 动起来」需先有视频底——本技能逐镜把素材图 + 镜头文案喂图生视频模型（**独立第三方**
-> `api.chenxingai.vip`，与火山**不共享**端点 / 密钥），片段落 `{cachePrefix}/{runId}/clips/`；
-> `render_compose` 再对片段加运镜并拼成成片。**某镜失败即该镜回落静图**（如实标注）。
+> 动起来」需先有视频底——本技能逐镜把素材图 + **画面提示词**（`edl.shots[].visualPrompt`；缺则
+> 回落口播文案并如实告警，ADR-073）喂图生视频模型（**独立第三方** `api.chenxingai.vip`，与火山
+> **不共享**端点 / 密钥），片段落 `{cachePrefix}/{runId}/clips/`；`render_compose` 再对片段加
+> 运镜并拼成成片。**某镜失败即该镜回落静图**（如实标注）。
+>
+> **首尾帧桥 + 下发前降采样**（ADR-074）：① 逐镜把**下一镜的图**当**尾帧**一起下发
+> （`images = [本镜图, 下一镜的图]`，第 2 位 = 尾帧；尾帧取「其后**最近一张有图的镜**」，
+> 末镜无尾帧）——聚合端点**没有**指南首尾帧用的 `content.role`，故这是**该接口面上最接近的
+> 落法**，**语义待真跑验证**（若按「多参考图」处理 ⇒ 退化为无桥，不产生错画面）；
+> ② 素材图超 I2V **输出**分辨率（`videogen_size` = `720x1280`）的，**下发前**等比缩到以内
+> （**只缩不放**，已在分辨率内则原图直用）→ 派生件落 `{cachePrefix}/{runId}/i2v_input/…`，
+> 失败**回落原图 + 如实告警、不丢镜**（指南：输入超标易出**指纹状纹理**）。两行为各配 env
+> 开关（默认开）：`FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE` / `FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT`。
 
 **为什么是独立 backend**：网关把每个 backend 的工具聚合为 `{prefix}__{remote_tool}`，
 而 **prefix 每 backend 只有一个**（`video_localizer` 已被 localize 占用）。故 dsp 以

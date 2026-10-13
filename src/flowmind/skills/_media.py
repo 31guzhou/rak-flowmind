@@ -1,8 +1,9 @@
 """ffmpeg 薄封装：视频/音频的机械媒体操作。
 
-只做非 AI 的媒体处理（提音轨/探时长/抽帧/擦除区域/烧字幕/混音），
+只做非 AI 的媒体处理（提音轨/探时长/抽帧/等比缩放/擦除区域/烧字幕/混音），
 一切智能环节（ASR/TTS/翻译/OCR）走云 API——见 CLAUDE.md 云优先原则。
-命令通过 run_ffmpeg/run_ffprobe 间接执行，测试可注入 fake。
+命令通过 run_ffmpeg/run_ffprobe 间接执行，测试可注入 fake；
+图片的探尺寸 / 等比缩放走惰性 PIL（不经命令行，故无 fake 注入点）。
 """
 from __future__ import annotations
 
@@ -70,6 +71,55 @@ def extract_frame(video_path: str, timestamp_s: float, out_path: str) -> str:
     ])
     if rc != 0:
         raise MediaError(f"抽帧失败: {err[-200:]}")
+    return out_path
+
+
+def _pil():  # noqa: ANN202  惰性导入 Pillow（类型不便标注）
+    """惰性导入 Pillow（图片处理用）。未装即如实报错——不静默跳过。"""
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover  运行时由 rapidocr 带入
+        raise MediaError("未安装 Pillow——图片探尺寸/缩放需要它") from exc
+    return Image
+
+
+def probe_image_size(image_path: str) -> tuple[int, int]:
+    """图片像素尺寸 ``(width, height)``（读不出即抛 MediaError）。
+
+    不用 ``probe_media``：那条走 ffprobe 且**要求 format.duration**，而图片没有时长。
+    """
+    Image = _pil()
+    try:
+        with Image.open(image_path) as im:
+            return int(im.width), int(im.height)
+    except (OSError, ValueError) as exc:
+        raise MediaError(f"读取图片尺寸失败: {exc}") from exc
+
+
+def scale_image_to_fit(
+    image_path: str, out_path: str, max_w: int, max_h: int, *, quality: int = 92,
+) -> str:
+    """等比**缩小**到长宽均不超过 ``(max_w, max_h)``，落 ``out_path``；已不超则原样返回入参。
+
+    **只缩不放**：放大既不解决上游口径问题，又只会更糊。``max_w`` / ``max_h`` 传 0 视为不限制。
+    返回值是**实际可用路径**（未缩时 = ``image_path``），调用方据此决定是否落派生件。
+    """
+    if not (max_w and max_h):
+        return image_path
+    w, h = probe_image_size(image_path)
+    if w <= max_w and h <= max_h:
+        return image_path
+    ratio = min(max_w / w, max_h / h)
+    tw, th = max(1, round(w * ratio)), max(1, round(h * ratio))
+    Image = _pil()
+    save_kw: dict = {"quality": quality} if out_path.lower().endswith((".jpg", ".jpeg")) else {}
+    try:
+        with Image.open(image_path) as im:
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.resize((tw, th), Image.LANCZOS).save(out_path, **save_kw)
+    except (OSError, ValueError) as exc:
+        raise MediaError(f"图片等比缩放失败: {exc}") from exc
     return out_path
 
 
