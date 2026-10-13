@@ -445,8 +445,9 @@ class DspConfig(BaseModel):
     # **显式常量、非实测**——`_dsp_align` 用它兜底并在 warnings 里如实说明，绝不编造实测值。
     timeline_silent_shot_ms: int = Field(default=1500, validate_default=True)
 
-    # ── 切镜节奏收口（timeline_build · ADR-070）──
-    # 在**实测**轴上把分镜并/拆成终版镜头：过短的镜并入相邻镜、过长的镜在其内部句边界一分为二。
+    # ── 切镜节奏收口（timeline_build · ADR-070 / ADR-072）──
+    # 在**实测**轴上把分镜并/拆成终版镜头：过短的镜并入相邻镜、过长的镜在其内部一分为二
+    # （**先句边界、句内没有句边界就下沉到词边界**，切点恒为实测 token）。
     # 与 cross-dashboard 的 lib/content/dsp-cut.ts **同值**（改口径两边一起改，同 silent_shot_ms 先例）。
     timeline_shot_min_ms: int = Field(default=1500, validate_default=True)
     timeline_shot_max_ms: int = Field(default=6000, validate_default=True)
