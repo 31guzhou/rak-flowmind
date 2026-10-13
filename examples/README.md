@@ -7,7 +7,7 @@ GPU / PG / MQTT / Milvus / API key）：
 PYTHONPATH=$PWD/src conda run -n flowmind python examples/<name>_demo.py
 ```
 
-## 9 个 demo 一览
+## 18 个 demo 一览
 
 | 脚本 | 演示能力 | 你将看到 |
 |---|---|---|
@@ -19,7 +19,16 @@ PYTHONPATH=$PWD/src conda run -n flowmind python examples/<name>_demo.py
 | [`localize_search_demo.py`](./localize_search_demo.py) | 字幕语义检索（BGE + Milvus） | 向量命中、task_id 过滤、空库空态、服务不可用 → ok=False |
 | [`localize_video_demo.py`](./localize_video_demo.py) | 本地化流水线本体 | mock 全链路（ASR→翻译→擦除→克隆 TTS→合成）、无 key 显式 degraded、文件不存在 |
 | [`api_server_demo.py`](./api_server_demo.py) | 单端口 REST 任务通道冒烟 | health/manifest 发现、POST 202 → 轮询 → 流式下载、422/429 错误语义 |
+| [`auth_token_demo.py`](./auth_token_demo.py) | 调用方凭证校验（RakAuthMiddleware） | Bearer 验签、豁免前缀匿名可达、tenant_scope 三态 fail-closed、`X-Rak-Tenant` 被忽略 |
 | [`federation_register_demo.py`](./federation_register_demo.py) | 联邦自注册（PG+MQTT 双通道） | register QoS1 payload 契约、单通道降级仍完成注册、双通道全挂静默降级、心跳与优雅注销 |
+| [`dsp_timeline_build_demo.py`](./dsp_timeline_build_demo.py) | dsp 素材对齐 · **切镜收口** · 时间线锁定 | 实测逐句归属到镜头、比例兜底如实告警「归属为推断」、无口播镜吃停顿/尾部静默、收口并镜/拆镜、转场符号落 EDL、非法镜头时长 → VALIDATION |
+| [`dsp_tts_generate_demo.py`](./dsp_tts_generate_demo.py) | dsp 口播配音（豆包 · **DAG 起点**） | 无上游依赖也跑通、`text_prompt` 纯文案、出音轨 + **逐句实测时间戳**、预计超 120s / 无 shots → 明确报错 |
+| [`dsp_image_to_video_demo.py`](./dsp_image_to_video_demo.py) | dsp 图生视频（逐镜视频底 · §7.5 第 1 步） | 直链**转存**为不可变 key、未配密钥/缺锁定时间线/单镜出片失败各自如实降级、`maxShots` 成本闸 |
+| [`dsp_bgm_match_demo.py`](./dsp_bgm_match_demo.py) | dsp 背景音乐（**占位降级**） | 契约 §3.3：选曲接口未给 → 一律 degraded，成片空轨继续 |
+| [`dsp_subtitle_build_demo.py`](./dsp_subtitle_build_demo.py) | dsp 字幕 SRT | 依配音逐句时间戳出 SRT、时间点越界**如实报出**、无时间戳如实降级 |
+| [`dsp_cover_pick_demo.py`](./dsp_cover_pick_demo.py) | dsp 封面取帧 | 默认取第一镜的图、标题未确认即 degraded（不阻塞）、无图不臆造 |
+| [`dsp_cart_sticker_demo.py`](./dsp_cart_sticker_demo.py) | dsp 小黄车贴片 | 仅带货形态、商品锚点手工档、纯内容形态/缺锚点/越界各自如实降级 |
+| [`dsp_render_compose_demo.py`](./dsp_render_compose_demo.py) | dsp 合成渲染（MediaKit） | EDL→`track[][]`、封面走 `output.cover` 抽帧、**24h 签名 URL 转存**为不可变 key、缺密钥/空轨道报错 |
 
 ## 🚀 Agent 开箱即用：`discover()`
 
@@ -55,7 +64,9 @@ for f in examples/*_demo.py; do
 done
 ```
 
-9 个 demo 全 PASS 是改动合并前的回归底线（本仓库无单测，demo 即冒烟测试）。
+18 个 demo 全 PASS 是改动合并前的回归底线（本仓库无单测，demo 即冒烟测试）。
+（`api_server_demo` / `auth_token_demo` 需 `uvicorn` / `starlette`；`localize_video_demo`
+需 GPU 侧依赖——在未装齐的裸 Python 环境里它们会各自报缺依赖，与技能层改动无关。）
 
 ## demo 都做了什么
 

@@ -10,9 +10,32 @@ import tomllib
 from pathlib import Path
 
 import tomli_w
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 DEFAULT_CONFIG_PATH = Path("flowmind.config.toml")  # 相对于当前工作目录（cwd）
+
+# 密钥/环境文件落点（与 skills/_secrets.py 同口径）：__file__ = <repo>/src/flowmind/config.py
+#   parents[0]=flowmind [1]=src [2]=<repo> [3]=工作区根
+_PROJECT_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+_WORKSPACE_ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
+
+_env_loaded = False
+
+
+def ensure_env_loaded() -> None:
+    """把工作区根 ``.env`` 与项目 ``.env`` 载入进程环境（幂等）。
+
+    先工作区根、后项目；``load_dotenv`` 不覆盖已存在变量，故根优先。
+    权威实现放在 config.py（各 Config 要按「**env 优先，config 兜底**」解析字段，
+    必须先有 env）；``skills/_secrets.py`` 复用本函数，避免两处漂移。
+    """
+    global _env_loaded
+    if _env_loaded:
+        return
+    load_dotenv(_WORKSPACE_ENV_PATH)
+    load_dotenv(_PROJECT_ENV_PATH)
+    _env_loaded = True
 
 
 class InventoryConfig(BaseModel):
@@ -327,6 +350,158 @@ class WechatPublishConfig(BaseModel):
     timeout_s: float = 30.0
 
 
+# dsp 非密钥配置项的 env 名（「env 优先，config 兜底」；密钥不在此，走 *_key_env + _secrets）
+_DSP_ENV_FIELDS: dict[str, str] = {
+    "storage_endpoint": "FLOWMIND_DSP_S3_ENDPOINT",
+    "storage_bucket": "FLOWMIND_DSP_S3_BUCKET",
+    "storage_region": "FLOWMIND_DSP_S3_REGION",
+    "mediakit_api_base": "FLOWMIND_DSP_MEDIAKIT_API_BASE",
+    "mediakit_queue_id": "FLOWMIND_DSP_MEDIAKIT_QUEUE_ID",
+    "mediakit_output_destination": "FLOWMIND_DSP_MEDIAKIT_OUTPUT_DESTINATION",
+    "tts_api_base": "FLOWMIND_DSP_TTS_API_BASE",
+    "tts_default_speaker": "FLOWMIND_DSP_TTS_SPEAKER",
+    "timeline_silent_shot_ms": "FLOWMIND_DSP_TIMELINE_SILENT_SHOT_MS",
+    "timeline_shot_min_ms": "FLOWMIND_DSP_TIMELINE_SHOT_MIN_MS",
+    "timeline_shot_max_ms": "FLOWMIND_DSP_TIMELINE_SHOT_MAX_MS",
+    "timeline_shot_limit_min": "FLOWMIND_DSP_TIMELINE_SHOT_LIMIT_MIN",
+    "timeline_shot_limit_max": "FLOWMIND_DSP_TIMELINE_SHOT_LIMIT_MAX",
+    "videogen_api_base": "FLOWMIND_DSP_VIDEOGEN_API_BASE",
+    "videogen_model": "FLOWMIND_DSP_VIDEOGEN_MODEL",
+    "videogen_aspect_ratio": "FLOWMIND_DSP_VIDEOGEN_ASPECT_RATIO",
+    "videogen_size": "FLOWMIND_DSP_VIDEOGEN_SIZE",
+    "videogen_quality": "FLOWMIND_DSP_VIDEOGEN_QUALITY",
+}
+
+
+class DspConfig(BaseModel):
+    """dsp · 抖音成片技能套件（8 技能）的可配置参数（附通用默认值）。
+
+    契约真源（cross-dashboard 侧）：
+    ``docs/architecture/2026-10-11-dsp-backend-skill-contract.md``
+    （§2 共同契约 / §3 逐技能 / §7 MediaKit 参数级映射）。
+    厂商接口字段已按 ``docs/vendor/`` 的**入仓真文档**逐条核实。
+
+    安全约定（同 MarketingImageConfig / ContentConfig）：云厂商密钥只从环境变量
+    读取——``*_key_env`` 只存 **env var 名**，绝不存明文、绝不进 toml / commit；
+    未配置时相关技能**如实降级或抛结构化错误**，绝不返回假产物。
+
+    配置源（全仓库统一「**env 优先，config 兜底**」）：端点/桶/队列等**非密钥**项
+    经下方 ``_env_strings`` / ``_env_secure`` 解析 env（见 ``_DSP_ENV_FIELDS``），
+    ``flowmind.config.toml`` 与内置默认兜底。
+
+    部署：本族以独立 backend 注册（``prefix=dsp``，网关聚合出 ``dsp__{tool}``），
+    见 ``skills/__init__.py`` 的族筛选与 ``FLOWMIND_SKILL_FAMILIES``。
+    """
+
+    # ── 对象存储（S3/MinIO 兼容；契约 §2.4「目录 = 云存储 prefix」）──
+    # 选 S3/MinIO 而非火山 TOS：回传的 key 必须能被 cross-dashboard
+    # ``/api/assets/<key>`` 按**当前租户段**取到（其 files.ts fail-closed 只认本租户段）。
+    storage_endpoint: str = Field(default="", validate_default=True)   # env FLOWMIND_DSP_S3_ENDPOINT
+    storage_region: str = Field(default="", validate_default=True)     # env FLOWMIND_DSP_S3_REGION
+    storage_bucket: str = Field(default="flowmind", validate_default=True)  # env FLOWMIND_DSP_S3_BUCKET
+    storage_access_key_env: str = "S3_ACCESS_KEY"
+    storage_secret_key_env: str = "S3_SECRET_KEY"
+    storage_secure: bool = Field(default=True, validate_default=True)  # env FLOWMIND_DSP_S3_SECURE
+    storage_timeout_s: float = 30.0
+    presign_ttl_s: int = 3600             # 预签名 URL 有效期（供 MediaKit 取素材）
+
+    # ── 火山 AI MediaKit「多轨道剪辑」（render_compose 的实现落点 · §7）──
+    mediakit_api_base: str = Field(  # env FLOWMIND_DSP_MEDIAKIT_API_BASE
+        default="https://mediakit.cn-beijing.volces.com", validate_default=True)
+    mediakit_key_env: str = "DSP_MEDIAKIT_API_KEY"   # Bearer；集群 Secret，密钥只在后端
+    mediakit_multi_track_path: str = "/api/v1/tools/multi-track-edit"
+    mediakit_camera_motion_path: str = "/api/v1/tools/apply-camera-motion"  # 运镜（§7.5 第 2 步）
+    mediakit_task_path: str = "/api/v1/tasks/{task_id}"
+    mediakit_timeout_s: float = 60.0       # 单次 HTTP（提交 / 查询）
+    mediakit_poll_interval_s: float = 5.0
+    mediakit_poll_max_s: float = 1800.0    # 轮询上限（超时如实报错，不假装完成）
+    mediakit_canvas_width: int = 1080      # 9:16
+    mediakit_canvas_height: int = 1920
+    mediakit_output_format: str = "mp4"
+    mediakit_output_fps: int = 30
+    mediakit_queue_id: str = Field(default="", validate_default=True)  # env FLOWMIND_DSP_MEDIAKIT_QUEUE_ID
+    mediakit_aigc_label: str = "1"         # §7.3④ AIGC 标识（"1" = 含 AI 生成内容）
+    mediakit_output_destination: str = Field(default="", validate_default=True)  # env FLOWMIND_DSP_MEDIAKIT_OUTPUT_DESTINATION
+
+    # ── 火山豆包语音「音频生成」（tts_generate · §3.1）──
+    tts_api_base: str = Field(  # env FLOWMIND_DSP_TTS_API_BASE
+        default="https://openspeech.bytedance.com", validate_default=True)
+    tts_create_path: str = "/api/v3/tts/create"
+    tts_key_env: str = "DSP_TTS_API_KEY"   # 新版控制台 X-Api-Key 单头
+    tts_model: str = "seed-audio-1.0"
+    tts_default_speaker: str = Field(default="", validate_default=True)  # env FLOWMIND_DSP_TTS_SPEAKER
+    tts_format: str = "mp3"                # 契约要 mp3（文档：mp3 默认采样率 44100）
+    tts_sample_rate: int = 24000           # 文档允许集 8000/16000/24000/32000/40000/44100/48000
+    tts_speech_rate: int = 0               # [-50, 100]；-50=0.5x，100=2.0x
+    tts_loudness_rate: int = 0             # [-50, 100]（文档 audio_config.loudness_rate）
+    tts_pitch_rate: int = 0                # [-12, 12]（文档 audio_config.pitch_rate）
+    tts_timeout_s: float = 120.0           # 单次合成上限（文档：单次最长 120s）
+    tts_max_chars: int = 3000              # text_prompt ≤ 3000 字符
+    tts_enable_subtitle: bool = True       # 取 voSegments（句级 / 词级时间戳）
+    tts_aigc_watermark: bool = False       # watermark.aigc_watermark（显式标识，按合规口径定）
+
+    # ── 时间线对齐（timeline_build · 契约 §3.2，ADR-069）──
+    # 无口播镜（配音句子数 < 镜头数，或该镜无文案）的展示时长（ms；env FLOWMIND_DSP_TIMELINE_SILENT_SHOT_MS）。
+    # **显式常量、非实测**——`_dsp_align` 用它兜底并在 warnings 里如实说明，绝不编造实测值。
+    timeline_silent_shot_ms: int = Field(default=1500, validate_default=True)
+
+    # ── 切镜节奏收口（timeline_build · ADR-070）──
+    # 在**实测**轴上把分镜并/拆成终版镜头：过短的镜并入相邻镜、过长的镜在其内部句边界一分为二。
+    # 与 cross-dashboard 的 lib/content/dsp-cut.ts **同值**（改口径两边一起改，同 silent_shot_ms 先例）。
+    timeline_shot_min_ms: int = Field(default=1500, validate_default=True)
+    timeline_shot_max_ms: int = Field(default=6000, validate_default=True)
+    # 收口后镜头数的合法区间；越界**只告警不夹取**（数据诚实）。
+    timeline_shot_limit_min: int = Field(default=2, validate_default=True)
+    timeline_shot_limit_max: int = Field(default=10, validate_default=True)
+
+    # ── 图生视频 · 视频生成（image_to_video 的实现落点 · 契约 §7.5 第 1 步）──
+    # 厂商 = 晨星 AI（api.chenxingai.vip，第三方聚合，转售 Seedance / MiniMax 等）。
+    # 文档（用户提供）：提交 ``POST /videos/generations`` 返平铺 ``{id, task_id, status}``
+    # → 轮询 ``GET /videos/{task_id}`` → ``completed`` 后取 ``metadata.url`` 直链（**24h**）。
+    # ⚠️ 这是**独立第三方**，与火山 MediaKit / 豆包语音不共享端点与密钥。
+    videogen_api_base: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_API_BASE
+        default="https://api.chenxingai.vip", validate_default=True)
+    videogen_key_env: str = "DSP_VIDEOGEN_API_KEY"   # Authorization: Bearer sk-…（密钥只在后端）
+    videogen_submit_path: str = "/videos/generations"
+    videogen_task_path: str = "/videos/{task_id}"
+    videogen_content_path: str = "/videos/{task_id}/content"   # 带鉴权代理下载（备用）
+    videogen_timeout_s: float = 60.0        # 单次 HTTP
+    videogen_poll_interval_s: float = 8.0   # 文档建议 5–10s
+    videogen_poll_max_s: float = 1800.0     # 轮询上限（超时如实报错，不假装完成）
+    videogen_model: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_MODEL
+        default="seedance-2.5-global-sp", validate_default=True)
+    videogen_aspect_ratio: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_ASPECT_RATIO
+        default="9:16", validate_default=True)   # 竖屏（文档：Seedance 默认 9:16）
+    # 文档可选 size = 1280x720 / 720x1280 / 1024x1024 / 1792x1024 / 1024x1792
+    # —— **无 1080x1920**；9:16 里只有 720x1280 是精确比例，成片由 MediaKit 缩到画布。
+    videogen_size: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_SIZE
+        default="720x1280", validate_default=True)
+    videogen_quality: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_QUALITY
+        default="standard", validate_default=True)  # standard | high
+    videogen_max_ref_images: int = 9        # 文档：seedance 系列参考图 ≤ 9 张
+    videogen_prompt_suffix: str = ""        # 逐镜 prompt 后缀（如统一加「运镜」提示）
+
+    @field_validator(*_DSP_ENV_FIELDS, mode="before")
+    @classmethod
+    def _env_strings(cls, v: str, info: ValidationInfo) -> str:
+        """env 覆盖非密钥字段（空值不生效，回落 toml / 内置默认）。"""
+        ensure_env_loaded()
+        env = os.environ.get(_DSP_ENV_FIELDS[info.field_name], "").strip()
+        return env or v
+
+    @field_validator("storage_secure", mode="before")
+    @classmethod
+    def _env_secure(cls, v: bool) -> bool:
+        """env FLOWMIND_DSP_S3_SECURE 覆盖（0/false/no 关；其余不生效）。"""
+        ensure_env_loaded()
+        raw = os.environ.get("FLOWMIND_DSP_S3_SECURE", "").strip().lower()
+        if raw in ("0", "false", "no"):
+            return False
+        if raw in ("1", "true", "yes"):
+            return True
+        return v
+
+
 class CrawlerConfig(BaseModel):
     """智能爬虫套件（content_web_fetch / crawler_sentiment / crawler_deadlink）可配置参数。"""
     timeout_s: float = 15.0
@@ -472,6 +647,7 @@ class FlowmindConfig(BaseModel):
     image_skill: ImageSkillConfig = Field(default_factory=ImageSkillConfig)
     b2b_push: B2bPushConfig = Field(default_factory=B2bPushConfig)
     wechat_publish: WechatPublishConfig = Field(default_factory=WechatPublishConfig)
+    dsp: DspConfig = Field(default_factory=DspConfig)
     crawler: CrawlerConfig = Field(default_factory=CrawlerConfig)
     infra: InfraConfig = Field(default_factory=InfraConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)

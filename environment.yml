@@ -64,5 +64,6 @@ dependencies:
       - psycopg2-binary>=2.9       # TaskStore（经 PgBouncer 事务模式，短连接）
       - paho-mqtt>=2.0             # 任务进度事件（EMQX，终态 retain）
       - pymilvus>=2.4              # 字幕分段向量库（localize_segments，768 维 bge）
+      - boto3>=1.34                # dsp 成片产物对象存储（S3/MinIO 兼容；懒加载）
       # ── 开发工具 ──
       - ruff>=0.6                  # lint（合并前唯一质量门；本仓库无单测，验证靠 demo）

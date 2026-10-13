@@ -1,0 +1,265 @@
+"""render_compose 技能：合成渲染（火山 AI MediaKit）——**唯一渲染、DAG 汇点**。
+
+契约 §3.7：依赖 ``tts`` / ``timeline`` / ``bgm`` / ``subtitle`` / ``cover`` / ``cart``
+（**缺席者按裁剪后的依赖表传入**）；降级 **abort**；风险 **L1**。
+
+职责：按 EDL 铺 **主轨（图生视频片段 ``video`` / 静图 ``image``）+ 音轨**，把运镜 /
+字幕 / 贴片 / 封面位**一次性烧制**，成片 mp4 落**成片目录**（契约 §2.4：
+``{outputPrefix}/{runId}/final.mp4``）。
+
+关键契约点：
+- §7.3② **成片必须转存**：MediaKit 的 ``result.video_url`` 是 **24h 签名 URL**，
+  **不得**直接当 ``storedKey``；须落 ``{outputPrefix}/{runId}/final.mp4`` 再回 key。
+- §7.3②（同款）**运镜产物也必须转存**：见 ``_motion_to_storage``。
+- §7.5 **运镜两步**：本仓第 1 步（图→视频）由 ``video`` 节点承担，本步做第 2 步
+  （``apply-camera-motion``）——**只对拿到片段的镜头**，无片段者如实标注。
+- §7.1 素材经**预签名 URL**（同源 ``/api/assets`` 火山拉不到，须换成可达引用）。
+- §7.3④ AIGC 标识：``extra_param.upload.aigc_meta`` 由 MediaKit 客户端注入。
+
+降级 **abort**：失败即抛错（``invoke()`` 兜成 ``ok=False``），运行器据此中止整单，
+成片字段保持空——**绝不伪造成片**。
+"""
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+from flowmind.config import load_config
+from flowmind.contracts import SkillOutput
+from flowmind.skill import skill
+from flowmind.skills import _dsp_common as common
+from flowmind.skills import _dsp_mediakit as mediakit
+from flowmind.skills import _dsp_storage as storage
+from flowmind.skills._dsp_common import DspBaseInput
+
+_VERSION = "0.1.0"
+
+
+class RenderComposeInput(DspBaseInput):
+    """渲染入参（公共上下文 + 可选字幕样式）。"""
+    subtitleFontSize: int = Field(default=48)
+
+
+class RenderComposeData(BaseModel):
+    """出参：成片 key + 时长 + 分辨率（本仓就取 ``storedKey`` 当成品）。"""
+    storedKey: str
+    durationMs: int
+    width: int
+    height: int
+    note: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
+def _presign(key: str) -> str:
+    """素材 key → 预签名 URL（空 key 返回空串，由调用方跳过）。"""
+    return storage.presign_get(key) if key else ""
+
+
+def _split_stickers(raw: object) -> tuple[list[dict], list[str]]:
+    """拆贴片：带图片 source 的可烧制；纯平台组件（商品链接）不烧进画面（§7.2）。"""
+    burnable: list[dict] = []
+    notes: list[str] = []
+    if isinstance(raw, list):
+        for sticker in raw:
+            if not isinstance(sticker, dict):
+                continue
+            if sticker.get("source"):
+                burnable.append(sticker)
+            else:
+                ref = (sticker.get("productRef") or {}).get("value", "")
+                notes.append(f"贴片（商品锚点 {ref or '未给'}）为平台组件，未烧进画面")
+    return burnable, notes
+
+
+def _motion_to_storage(cfg, inp: RenderComposeInput, shot_id: str,
+                       clip_key: str, style: str) -> str:
+    """对片段加运镜（``apply-camera-motion``）并**转存**回自有对象存储，返回新 key。
+
+    §7.3② 同款纪律：运镜返回的 ``result.video_url`` 是 **24h 签名 URL**，**不得**当 key
+    直接交给最终渲染（会过期）——必须先落自有存储，再对 key 预签名。
+    """
+    result = mediakit.apply_camera_motion(
+        cfg, video_url=_presign(clip_key), motion_style=style)
+    url = str(result.get("video_url") or "")
+    if not url.startswith(("http://", "https://")):
+        raise mediakit.DspMediakitError(
+            f"运镜返回的地址不可取用（{url[:80]}）——本仓只支持 http(s) 结果的下载-转存。",
+            category="environment")
+    dest = common.step_key(inp.cachePrefix, inp.runId, "motion", f"{shot_id}.mp4")
+    with tempfile.TemporaryDirectory(prefix="dsp-motion-") as tmp:
+        local = storage.fetch_to_file(url, str(Path(tmp) / f"{shot_id}.mp4"))
+        storage.put_file(local, dest, content_type="video/mp4")
+    return dest
+
+
+@skill(id="render_compose", name="合成渲染", version=_VERSION,
+       category="抖音成片", tags=["dsp", "render", "video"])
+def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
+    """按 EDL 铺轨并一次性烧制，成片落 ``{outputPrefix}/{runId}/final.mp4`` 并回 key。"""
+    cfg = load_config().dsp
+    edl = common.dep_edl(inp.deps)
+    if edl is None:
+        raise ValueError("render_compose 需要 deps.timeline.edl（渲染以锁定 EDL 为准）。")
+    if not mediakit.mediakit_configured(cfg):
+        raise mediakit.DspMediakitError(
+            f"未配置渲染密钥 {cfg.mediakit_key_env}（dsp 成片必需）；"
+            "契约 §7.1：MediaKit 密钥由后端经集群 Secret 持有。",
+            category="environment",
+        )
+
+    warnings: list[str] = []
+
+    # ── 逐镜素材：``video`` 节点（图生视频）的片段优先，缺片段回落静图 ──
+    video_dep = common.dep(inp.deps, "video") or {}
+    raw_clips = video_dep.get("clips")
+    clips = [c for c in raw_clips if isinstance(c, dict)] if isinstance(raw_clips, list) else []
+    clip_by_shot = {
+        str(c.get("shotId")): c for c in clips if c.get("shotId") and c.get("key")
+    }
+
+    # 镜头 id → EDL effect（``edl.shots`` 与 image 轨 segments **索引对齐**）
+    image_track = next((t for t in edl.tracks if t.kind == "image"), None)
+    segs = image_track.segments if image_track else []
+    effect_by_shot = {
+        shot.id: (segs[i].effect if i < len(segs) else None)
+        for i, shot in enumerate(edl.shots)
+    }
+
+    # 运镜（契约 §7.5 第 2 步）：真文档核实 apply-camera-motion **只接受视频**
+    # （``docs/vendor/智能处理_视频添加运镜_1785416057.pdf``）——故只有拿到片段的镜头
+    # 才能运镜；无片段的镜头**如实标注**，不静默丢弃。
+    clip_urls: dict[str, str] = {}
+    motion_applied = 0
+    for shot_id, clip in clip_by_shot.items():
+        key = str(clip["key"])
+        effect = effect_by_shot.get(shot_id)
+        if effect:
+            style = mediakit.motion_style_for(effect)
+            if not style:
+                warnings.append(
+                    f"镜头 {shot_id} 的运镜 {effect!r} 未登记到 MediaKit motion_style——该镜跳过运镜"
+                )
+            else:
+                key = _motion_to_storage(cfg, inp, shot_id, key, style)
+                motion_applied += 1
+        clip_urls[shot_id] = _presign(key)
+    if clip_urls:
+        warnings.append(f"主轨用图生视频片段：{len(clip_urls)} 镜（其中 {motion_applied} 镜已加运镜）")
+
+    no_clip_motion = [
+        shot_id for shot_id, effect in effect_by_shot.items()
+        if effect and shot_id not in clip_by_shot
+    ]
+    if no_clip_motion:
+        warnings.append(
+            f"EDL 含 {len(no_clip_motion)} 个镜头标了运镜（effect），但这些镜头没有视频片段"
+            "（video 节点未生成 / 该镜未出片）——运镜需先有视频底，这些镜头成片无运镜"
+        )
+
+    # 静图轨：仅无片段（或片段缺失）的镜头需要其图
+    still_keys = {
+        seg.sourceKey
+        for track in edl.tracks if track.kind == "image"
+        for seg in track.segments if seg.sourceKey
+    }
+    image_urls = {key: _presign(key) for key in still_keys}
+
+    tts = common.dep(inp.deps, "tts") or {}
+    bgm = common.dep(inp.deps, "bgm") or {}
+    subtitle = common.dep(inp.deps, "subtitle") or {}
+    cover = common.dep(inp.deps, "cover") or {}
+    cart = common.dep(inp.deps, "cart") or {}
+
+    audio_key = str(tts.get("audioKey") or "")
+    if not audio_key:
+        warnings.append("无音轨（deps.tts.audioKey 缺失）：成片无口播（若已关「智能配音」属预期）")
+    else:
+        # 新不变量（ADR-069）：锁定时间线的 totalMs **就是音频实测总长**（timeline 按逐句实测锁）。
+        # 两者不符即说明 EDL 与配音不同源，如实报出（不静默重算）。
+        try:
+            audio_ms = int(tts.get("durationMs"))
+        except (TypeError, ValueError):
+            audio_ms = 0
+        if audio_ms and abs(audio_ms - edl.totalMs) > 50:
+            warnings.append(
+                f"配音实测总长 {audio_ms}ms 与锁定时间线 {edl.totalMs}ms 不一致"
+                "（按 ADR-069，时间线应即音频总长）——请核对，渲染仍以 EDL 为准。"
+            )
+
+    stickers, sticker_notes = _split_stickers(cart.get("stickers"))
+    warnings.extend(sticker_notes)
+
+    # 转场（ADR-070）：EDL 记的是**符号名**，未登记厂商资源 ID 的会被如实回落硬切——在此告警。
+    warnings.extend(mediakit.transition_warnings(edl))
+
+    tracks = mediakit.build_tracks(
+        edl,
+        image_urls=image_urls,
+        clip_urls=clip_urls,
+        audio_url=_presign(audio_key),
+        bgm_url=_presign(str(bgm.get("bgmKey") or "")),
+        srt_url=_presign(str(subtitle.get("srtKey") or "")),
+        subtitle_font_size=inp.subtitleFontSize,
+        canvas_width=cfg.mediakit_canvas_width,
+        canvas_height=cfg.mediakit_canvas_height,
+    )
+    if not tracks:
+        raise mediakit.DspMediakitError(
+            "渲染轨道为空：EDL 各镜均未选到图（timeline 已留空位）——无可渲染内容。",
+            category="video",
+        )
+
+    cover_at = cover.get("atMs")
+    body = mediakit.build_body(
+        cfg, tracks=tracks,
+        client_token=inp.idempotencyKey or f"{inp.runId}:{inp.stepId}",
+        cover_at_ms=int(cover_at) if cover_at is not None else None,
+    )
+    result = mediakit.render(cfg, body)
+
+    video_url = str(result.get("video_url") or "")
+    duration_s = float(result.get("duration") or 0)
+    duration_ms = int(duration_s * 1000) or edl.totalMs
+    final = common.final_key(inp.outputPrefix, inp.runId, ext=cfg.mediakit_output_format)
+
+    if video_url.startswith(("http://", "https://")):
+        # §7.3② 转存：签名 URL（24h 失效）→ 自有对象存储的不可变 key
+        with tempfile.TemporaryDirectory(prefix="dsp-render-") as tmp:
+            local = storage.fetch_to_file(video_url, str(Path(tmp) / f"final.{cfg.mediakit_output_format}"))
+            storage.put_file(local, final, content_type="video/mp4")
+    else:
+        raise mediakit.DspMediakitError(
+            f"MediaKit 返回的成片地址不可直接取用（{video_url[:80]}）。"
+            "本仓只支持 http(s) 结果的下载-转存；若启用了 media_output_destination（tos://…），"
+            "需另配火山 TOS 客户端才能搬回自有对象存储。请清空对应 output_destination 配置"
+            "或补 TOS 接线。",
+            category="environment",
+        )
+
+    if result.get("resolution"):
+        warnings.append(f"MediaKit 实际分辨率：{result['resolution']}")
+
+    note = f"成片 {duration_ms}ms → {final}"
+    return SkillOutput(
+        data=RenderComposeData(
+            storedKey=final, durationMs=duration_ms,
+            width=cfg.mediakit_canvas_width, height=cfg.mediakit_canvas_height,
+            note=note, warnings=warnings,
+        ),
+        reasoning=[common.chain(
+            f"合成渲染完成：{final}（{duration_ms}ms，{cfg.mediakit_canvas_width}×{cfg.mediakit_canvas_height}）",
+            causal_analysis=(
+                f"按锁定 EDL（totalMs={edl.totalMs}ms）铺 {len(tracks)} 轨；"
+                f"主轨 {len(clip_urls)} 段视频片段（其中 {motion_applied} 段加运镜）"
+                f" + {len(still_keys)} 张静图；"
+                "字幕/贴片/封面位一次性烧制；AIGC 标识元数据已注入。"
+            ),
+            risk_note=(
+                "渲染为一次性烧制（不可再编辑）；成片已转存为不可变 key，重跑 = 新 runId = 新 key。"
+            ),
+        )],
+        confidence=1.0,
+        sample_size=1,
+    )

@@ -1,0 +1,271 @@
+"""dsp_timeline_build 技能演示 —— 素材对齐 · 切镜收口 · 时间线锁定（唯一时间线写者）。
+
+运行：PYTHONPATH=<repo>/src conda run -n flowmind python examples/dsp_timeline_build_demo.py
+
+**ADR-069（定时长真源）与 ADR-070（删模板改自动切镜）之后**，本技能有三段职责，演示逐条覆盖：
+1. discover() 自动字段发现
+2. **实测路径**（有 `deps.tts`）：逐句实测归属到镜头；轨严格连续、末尾静默并入末镜
+3. **比例兜底**：文案与配音逐句对不上 → 按**文案字数**为权重连续切分 + **如实告警「归属为推断」**
+4. **中间无口播镜**：吃「停顿」⇒ **画面与配音仍逐帧对齐**（不插时间）
+5. **尾部无口播镜**：吃「尾部静默」；不足才取显式常量并如实标注（**非实测**）
+6. **估算路径**（无 `deps.tts`，配音开关关掉）：按 shots[].durationMs 累加 + 如实标注
+7. **收口 · 并镜**（ADR-070）：实测 < 1.5s 的镜并入相邻镜 → id 重排、文案随镜落进 EDL
+8. **收口 · 拆镜 + 转场**（ADR-070）：实测 > 6s 在内部句边界一分为二；被拆开的**内部**那刀按硬切，
+   用户设的转场保留在**整镜末尾**
+9. **转场**：非拆分边界上的符号值原样落 EDL（厂商资源 ID 未登记时由 render 侧如实回落硬切）
+10. error：镜头时长非法（ge=1）→ VALIDATION
+
+mock 方式：替换 ``_dsp_storage.put_text`` 为内存实现（本文件内），不需要对象存储。
+"""
+
+from __future__ import annotations
+
+import flowmind.skills  # noqa: F401  触发 @skill 注册
+from flowmind.discover import field_names
+from flowmind.skill import invoke
+from flowmind.skills import _dsp_storage as storage
+
+_WRITTEN: dict[str, str] = {}
+
+
+def section(title: str) -> None:
+    print(f"\n{'─' * 60}\n  {title}\n{'─' * 60}")
+
+
+def check(cond: bool, msg: str) -> None:
+    if not cond:
+        raise AssertionError(msg)
+
+
+def _install_storage() -> None:
+    def put_text(key: str, text: str, content_type: str | None = None) -> str:
+        _WRITTEN[key] = text
+        return key
+
+    def put_bytes(key: str, data: bytes, content_type: str | None = None) -> str:
+        _WRITTEN[key] = f"<{len(data)}B>"
+        return key
+
+    def presign_get(key: str, ttl_s: int | None = None) -> str:
+        return f"https://assets.example/{key}"
+
+    storage.put_text = put_text
+    storage.put_bytes = put_bytes
+    storage.presign_get = presign_get
+
+
+def _shots() -> list[dict]:
+    # 注：**不再有 weight 字段**（ADR-070：比例兜底的权重改由 `timeline` 从文案字数自算）。
+    # 旧 spec 快照里若还带 weight，pydantic 会忽略（extra 默认 ignore），故旧快照仍可跑。
+    return [
+        {"id": "s1", "label": "门头开场", "needKind": "门头", "durationMs": 3000,
+         "copy": "开门的瞬间", "clipKeys": ["dsp/scratch/t1/门店/门头1.jpg"], "cameraMotion": True},
+        {"id": "s2", "label": "产品特写", "needKind": "产品", "durationMs": 4000,
+         "copy": "保温12小时"},
+        {"id": "s3", "label": "人物", "needKind": "人物", "durationMs": 2000,
+         "copy": "上班族的早晨"},
+    ]
+
+
+def _seg(sentences: list[tuple[int, int, str]], audio_ms: int | None = None) -> dict:
+    """配音产物（`deps.tts`）——逐句实测轴 + 实测总时长。
+
+    ``audio_ms`` 显式给音频文件总长（可为末句之后留一段**尾部静默**）；缺省 = 末句结束时刻。
+    """
+    segs = [{"id": f"s{i}", "atMs": a, "durationMs": b - a, "text": t}
+            for i, (a, b, t) in enumerate(sentences, start=1)]
+    total = audio_ms if audio_ms is not None else (sentences[-1][1] if sentences else 0)
+    return {"audioKey": "dsp/scratch/t1/audio/voice.mp3", "durationMs": total,
+            "voSegments": segs, "voice": "zh_male_test", "warnings": []}
+
+
+def _ctx(**over) -> dict:
+    base = {
+        "mode": "content", "platform": "douyin",
+        "cachePrefix": "dsp/scratch/t1", "outputPrefix": "dsp/output/t1",
+        "runId": "run-demo-1", "stepId": "timeline", "idempotencyKey": "run-demo-1:timeline",
+        "shots": _shots(),
+        "materials": [
+            {"kind": "image", "key": "dsp/scratch/t1/门店/门头1.jpg", "category": "门头",
+             "width": 1080, "height": 1920},
+            {"kind": "image", "key": "dsp/scratch/t1/产品/杯1.jpg", "category": "产品"},
+        ],
+    }
+    base.update(over)
+    return base
+
+
+def _dump(d) -> None:
+    print(f"  edlKey    : {d.edlKey}")
+    print(f"  durationSource: {d.durationSource}")
+    print(f"  totalMs   : {d.edl.totalMs}")
+    for seg, shot in zip(d.edl.tracks[0].segments, d.edl.shots, strict=True):
+        print(f"    • {shot.id}: {seg.atMs}–{seg.atMs + seg.durationMs}ms "
+              f"src={seg.sourceKey or '(空位)'} effect={seg.effect} transition={seg.transition}")
+    for note in d.notes:
+        print(f"  note      : {note}")
+
+
+def main() -> None:
+    section("0) discover('timeline_build') —— Agent 自查字段")
+    for path, names in field_names("timeline_build").items():
+        print(f"  {path}: {names}")
+
+    section("1) 实测路径：3 镜逐句对上（指名 / 类目命中 / 无图留空位）")
+    _install_storage()
+    _WRITTEN.clear()
+    r = invoke("timeline_build", _ctx(deps={"tts": _seg([
+        (0, 2000, "开门的瞬间"),
+        (2400, 5200, "保温12小时"),      # 前有 400ms 停顿 → 归前一镜
+        (5600, 8300, "上班族的早晨"),
+    ], audio_ms=9000)}))
+    check(r.ok, "happy path 应 ok")
+    d = r.data
+    _dump(d)
+    check(d.durationSource == "measured", "有 deps.tts → 时长来源 = 实测")
+    check(d.edl.totalMs == 9000, "总时长 = 音频实测总长 9000ms（末尾 700ms 静默并入末镜）")
+    segs = d.edl.tracks[0].segments
+    check((segs[0].atMs, segs[0].durationMs) == (0, 2000), "s1 = 0–2000ms")
+    check((segs[1].atMs, segs[1].durationMs) == (2000, 3200), "s2 = 2000–5200ms（含 400ms 停顿）")
+    check((segs[2].atMs, segs[2].durationMs) == (5200, 3800), "s3 = 5200–9000ms（含 700ms 尾部静默）")
+    check(segs[0].effect == "kenburns", "第一镜开了运镜 → effect=kenburns")
+    check(segs[2].sourceKey == "", "第三镜无匹配图 → 留空位")
+    check(any("留空位" in n for n in d.notes), "留空位须在 notes 里如实说明")
+    check(not any("推断" in n or "静默常量" in n for n in d.notes), "逐句都对上 → 不应有推断/静默告警")
+    check(d.edlKey in _WRITTEN, "EDL 快照须落对象存储")
+    check(d.edl.tracks[1].kind == "vo" and d.edl.tracks[1].segments[0].durationMs == 9000,
+          "音轨占位 [0,totalMs)（sourceKey 由 render 挂）")
+
+    section("2) 比例兜底：文案与配音逐句**对不上** → 按权重切分 + 如实告警")
+    r = invoke("timeline_build", _ctx(deps={"tts": _seg([
+        (0, 1500, "开场白"),
+        (1500, 4500, "保温时长"),
+        (4500, 7000, "早高峰"),
+    ])}))
+    check(r.ok, "比例兜底路径应 ok")
+    d = r.data
+    _dump(d)
+    check(d.durationSource == "measured", "归属为推断，但时长仍来自实测轴")
+    check(d.edl.totalMs == 7000, "总时长 = 音频实测总长")
+    check(any("未对上" in n and "推断" in n for n in d.notes),
+          "文配失败须如实告警「归属为推断」（绝不假装精确）")
+    check([(s.atMs, s.durationMs) for s in d.edl.tracks[0].segments]
+          == [(0, 1500), (1500, 3000), (4500, 2500)], "三镜按句连续切分（1 句 1 镜）")
+
+    section("3) 中间无口播镜：吃「停顿」⇒ **画面与配音仍逐帧对齐**")
+    r = invoke("timeline_build", _ctx(deps={"tts": _seg([
+        (0, 1500, "开门的瞬间"),
+        (4000, 6000, "上班族的早晨"),   # s2 的文案没有对应句子
+    ])}))
+    check(r.ok, "中间无口播镜路径应 ok")
+    d = r.data
+    _dump(d)
+    check(d.edl.totalMs == 6000, "总时长仍 = 音频总长（未插时间，no desync）")
+    check([(s.atMs, s.durationMs) for s in d.edl.tracks[0].segments]
+          == [(0, 1500), (1500, 2500), (4000, 2000)],
+          "s2 吃掉 1500–4000ms 的停顿 2500ms；s3 自 4000ms 起（画面未偏移）")
+    check(any("无对口" in n or "没有对应句子" in n for n in d.notes), "无口播镜须如实说明")
+    check(not any("失同步" in n for n in d.notes), "中间吃停顿 → 不应报失同步")
+
+    section("4) 尾部无口播镜：吃「尾部静默」，不足则取显式常量（**非实测**）")
+    r = invoke("timeline_build", _ctx(deps={"tts": _seg([(0, 1500, "开门的瞬间")])}))
+    check(r.ok, "尾部无口播镜路径应 ok")
+    d = r.data
+    _dump(d)
+    segs = d.edl.tracks[0].segments
+    check((segs[0].atMs, segs[0].durationMs) == (0, 1500), "s1 实测 1500ms")
+    check((segs[1].durationMs, segs[2].durationMs) == (1500, 1500),
+          "s2/s3 无句可吃（音频尾部无静默）→ 取显式常量 1500ms")
+    check(any("静默常量" in n and "非实测" in n for n in d.notes),
+          "用常量必须如实标注「非实测」")
+    check(not any("失同步" in n for n in d.notes), "尾部拉长不破坏同步 → 不应报失同步")
+
+    section("5) 估算路径：无 deps.tts（配音开关关掉）→ 按估算累加 + 如实标注")
+    r = invoke("timeline_build", _ctx())
+    check(r.ok, "估算路径应 ok")
+    d = r.data
+    _dump(d)
+    check(d.durationSource == "estimated", "无 deps.tts → 时长来源 = 估算")
+    check(d.edl.totalMs == 9000, "总时长 = 3+4+2 = 9s（shots[].durationMs 累加）")
+    check(any("非实测" in n for n in d.notes), "估算路径须如实标注「非实测」")
+    check(0.0 < r.reasoning[0].confidence < 0.6, "估算路径置信度应低于实测路径（已如实下调）")
+    print(f"  confidence: {r.reasoning[0].confidence}（实测路径为 0.6，估算再乘 0.7）")
+
+    section("7) 收口 · 并镜（ADR-070）：实测 < 1.5s 的镜并入相邻镜 → id 重排、文案随镜入 EDL")
+    r = invoke("timeline_build", _ctx(deps={"tts": _seg([
+        (0, 2000, "开门的瞬间"),
+        (2000, 2600, "保温12小时"),     # 实测仅 600ms < 1500ms → 会被并掉
+        (2600, 5000, "上班族的早晨"),
+    ])}))
+    check(r.ok, "并镜路径应 ok")
+    d = r.data
+    _dump(d)
+    segs = d.edl.tracks[0].segments
+    check(len(segs) == 2, f"3 镜收口成 2 镜（600ms 的那镜并入相邻镜），实际 {len(segs)}")
+    check([(s.atMs, s.durationMs) for s in segs] == [(0, 2000), (2000, 3000)],
+          "并镜后两段仍**严格连续**（切点仍在句边界上）")
+    check([s.id for s in d.edl.shots] == ["s1", "s2"], "终版镜头 id 重排为 s1..sK")
+    check(d.edl.totalMs == 5000, "总时长不变（并镜只改镜界，不改总长）")
+    check(d.edl.shots[1].copy == "保温12小时上班族的早晨",
+          "并镜后**文案随镜落进 EDL**（下游据 edl.shots[].copy 出提示词，不回查 inp.shots）")
+    check(any("并镜 1 个" in n for n in d.notes), "并镜须如实说明")
+
+    section("8) 收口 · 拆镜 + 转场（ADR-070）：> 6s 在内部句边界一分为二；内部那刀按硬切")
+    shots_split = [
+        {"id": "s1", "label": "门头+产品", "needKind": "门头", "durationMs": 7000,
+         "copy": "开门的瞬间保温12小时", "transitionAfter": "dissolve"},
+        {"id": "s2", "label": "人物", "needKind": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
+    ]
+    r = invoke("timeline_build", _ctx(shots=shots_split, deps={"tts": _seg([
+        (0, 3000, "开门的瞬间"),
+        (3000, 7000, "保温12小时"),
+        (7000, 9000, "上班族的早晨"),
+    ])}))
+    check(r.ok, "拆镜路径应 ok")
+    d = r.data
+    _dump(d)
+    segs = d.edl.tracks[0].segments
+    check(len(segs) == 3, f"7s 的那镜在内部句边界一分为二 → 3 镜，实际 {len(segs)}")
+    check([(s.atMs, s.durationMs) for s in segs] == [(0, 3000), (3000, 4000), (7000, 2000)],
+          "拆点落在**句起点**上（句间停顿归前一半，与连续口径一致）")
+    check(segs[0].transition is None, "被拆开的**内部**那刀按硬切（用户设的转场不该落到中间边界）")
+    check(segs[1].transition == "dissolve", "用户设的转场保留在**整镜末尾**（即后半段的末尾）")
+    check(segs[2].transition is None, "末镜无下一镜 → 不写转场")
+    check(any("拆镜 1 个" in n for n in d.notes), "拆镜须如实说明")
+    check(any("硬切" in n and "未登记" in n for n in d.notes),
+          "转场须如实说明「厂商资源 ID 未登记即回落硬切」")
+    check(d.edl.shots[0].copy == "开门的瞬间保温12小时" and d.edl.shots[1].copy == "开门的瞬间保温12小时",
+          "拆开的两半**共用该镜文案**（它们讲的是同一段话）")
+    check(any("复用" in n for n in d.notes),
+          "拆出的两半同类目只有一张图 → 如实说明复用（画面观感等同不切）")
+
+    section("9) 转场：非拆分边界上的符号值原样落 EDL（厂商 ID 未登记 ⇒ render 侧回落硬切）")
+    shots_tr = [
+        {"id": "s1", "label": "门头", "needKind": "门头", "durationMs": 3000,
+         "copy": "开门的瞬间", "transitionAfter": "fade-black"},
+        {"id": "s2", "label": "人物", "needKind": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
+    ]
+    r = invoke("timeline_build", _ctx(shots=shots_tr, deps={"tts": _seg([
+        (0, 3000, "开门的瞬间"),
+        (3000, 5000, "上班族的早晨"),
+    ])}))
+    check(r.ok, "转场路径应 ok")
+    d = r.data
+    _dump(d)
+    check([s.transition for s in d.edl.tracks[0].segments] == ["fade-black", None],
+          "信息点之间的边界带上所选转场；末镜不写")
+    check(any("1 处转场" in n for n in d.notes), "记录了几处转场须如实说明")
+
+    section("10) error：镜头时长非法（durationMs=0 < ge=1）→ VALIDATION")
+    bad = _ctx(shots=[{"id": "s1", "durationMs": 0}])
+    r = invoke("timeline_build", bad)
+    print(f"  ok         : {r.ok}")
+    print(f"  error.code : {r.error.code if r.error else None}")
+    check(r.ok is False and r.error and r.error.code == "VALIDATION",
+          "非法入参应被 schema 拦为 VALIDATION")
+
+    print("\n✅ dsp_timeline_build_demo 全部通过")
+
+
+if __name__ == "__main__":
+    main()
