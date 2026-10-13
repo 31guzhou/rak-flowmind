@@ -5,7 +5,9 @@
 - 鉴权 = 新版控制台 **``X-Api-Key`` 单头**；另传 ``X-Api-Request-Id``（内部 trace id）
 - ``audio_config.format`` = mp3 / 24k；``speech_rate`` ∈ [-50, 100]
 - ``enable_subtitle=true`` → 响应带句级 / 词级时间戳 ``subtitle.sentences[].words[]``
-  （见契约 §3.1「✅ voSegments 的来源已确定」——**不用估算、不用改双向流式**）
+  （见契约 §3.1「✅ voSegments 的来源已确定」——**不用估算、不用改双向流式**）。
+  **词级 token 解析为 ``VoWord`` 并随 ``voSegments[].words`` 透出**——供 ``_dsp_align``
+  在超长镜的句内**下沉切到词边界**（``_dsp_align._split_point``）。
 - ``text_prompt`` 上限 3000 字符，单次最长 120 秒。
   **2026-10-13 改判（ADR-069）**：旧版在这里用自然语言做「时间轴控制」（总时长 + 人声时段）
   来让配音适配**已锁定**的画面；但那是**求模型配合**、厂商不保证精度，而现在的时长真源是
@@ -78,12 +80,29 @@ class DspTtsError(Exception):
 
 
 @dataclass
-class VoSentence:
-    """句级时间戳（ms，距音频开始）。"""
+class VoWord:
+    """**词级**（token）时间戳（ms，距音频开始；厂商 ``sentences[].words[]``，与句级同形）。
+
+    它是比句**更细**的**实测**边界：某个镜实测超长、而其内部没有句边界可切时，
+    ``_dsp_align._split_point`` 靠它把切点**下沉到词**（词边界同样是实测 token，
+    故「画面与配音逐帧对齐」不受影响——只是切得更细）。
+    """
     start_ms: int
     end_ms: int
     text: str
-    words: list[dict] = field(default_factory=list)
+
+    @property
+    def duration_ms(self) -> int:
+        return max(0, self.end_ms - self.start_ms)
+
+
+@dataclass
+class VoSentence:
+    """句级时间戳（ms，距音频开始）+ 其下的**词级** token（可空）。"""
+    start_ms: int
+    end_ms: int
+    text: str
+    words: list[VoWord] = field(default_factory=list)
 
     @property
     def duration_ms(self) -> int:
@@ -152,8 +171,27 @@ def _build_payload(cfg: DspConfig, *, text_prompt: str, speaker: str, speech_rat
     return payload
 
 
+def _parse_words(raw: object) -> list[VoWord]:
+    """解析 ``sentences[].words[]``（词级 token）——形状不对的条目**丢弃**（不臆造时间戳）。"""
+    out: list[VoWord] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        start, end = item.get("start_time"), item.get("end_time")
+        if start is None or end is None:
+            continue
+        try:
+            out.append(VoWord(start_ms=int(start), end_ms=int(end),
+                              text=str(item.get("text", ""))))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _parse_sentences(raw: dict) -> tuple[list[VoSentence], int]:
-    """从响应里取 ``subtitle.sentences`` 与总时长（缺失即如实报错，不臆造）。"""
+    """从响应里取 ``subtitle.sentences``（含词级 ``words``）与总时长（缺失即如实报错，不臆造）。"""
     subtitle = None
     if isinstance(raw, dict):
         subtitle = raw.get("subtitle")
@@ -167,7 +205,7 @@ def _parse_sentences(raw: dict) -> tuple[list[VoSentence], int]:
             end = int(sent.get("end_time", 0))
             sentences.append(VoSentence(
                 start_ms=start, end_ms=end, text=str(sent.get("text", "")),
-                words=list(sent.get("words") or []),
+                words=_parse_words(sent.get("words")),
             ))
             duration_ms = max(duration_ms, end)
     return sentences, duration_ms

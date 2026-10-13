@@ -10,8 +10,8 @@
 5. **尾部无口播镜**：吃「尾部静默」；不足才取显式常量并如实标注（**非实测**）
 6. **估算路径**（无 `deps.tts`，配音开关关掉）：按 shots[].durationMs 累加 + 如实标注
 7. **收口 · 并镜**（ADR-070）：实测 < 1.5s 的镜并入相邻镜 → id 重排、文案随镜落进 EDL
-8. **收口 · 拆镜 + 转场**（ADR-070）：实测 > 6s 在内部句边界一分为二；被拆开的**内部**那刀按硬切，
-   用户设的转场保留在**整镜末尾**
+8. **收口 · 拆镜 + 转场**（ADR-070）：实测 > 6s 在内部最近的合法边界一分为二——**先句边界，
+   句内下沉到词边界**（8b 专测后者）；被拆开的**内部**那刀按硬切，用户设的转场保留在**整镜末尾**
 9. **转场**：非拆分边界上的符号值原样落 EDL（厂商资源 ID 未登记时由 render 侧如实回落硬切）
 10. error：镜头时长非法（ge=1）→ VALIDATION
 
@@ -67,13 +67,19 @@ def _shots() -> list[dict]:
     ]
 
 
-def _seg(sentences: list[tuple[int, int, str]], audio_ms: int | None = None) -> dict:
-    """配音产物（`deps.tts`）——逐句实测轴 + 实测总时长。
+def _seg(sentences: list[tuple], audio_ms: int | None = None) -> dict:
+    """配音产物（`deps.tts`）——逐句实测轴（含**词级 token**）+ 实测总时长。
 
+    每项 = ``(start, end, text)`` 或 ``(start, end, text, words)``；``words`` =
+    ``[(start, end, text), …]`` 词级 token（供 ``_dsp_align`` 的**句内下沉切分**）。
     ``audio_ms`` 显式给音频文件总长（可为末句之后留一段**尾部静默**）；缺省 = 末句结束时刻。
     """
-    segs = [{"id": f"s{i}", "atMs": a, "durationMs": b - a, "text": t}
-            for i, (a, b, t) in enumerate(sentences, start=1)]
+    segs = []
+    for i, item in enumerate(sentences, start=1):
+        a, b, t = item[0], item[1], item[2]
+        words = [{"atMs": wa, "durationMs": wb - wa, "text": wt}
+                 for (wa, wb, wt) in (item[3] if len(item) > 3 else [])]
+        segs.append({"id": f"s{i}", "atMs": a, "durationMs": b - a, "text": t, "words": words})
     total = audio_ms if audio_ms is not None else (sentences[-1][1] if sentences else 0)
     return {"audioKey": "dsp/scratch/t1/audio/voice.mp3", "durationMs": total,
             "voSegments": segs, "voice": "zh_male_test", "warnings": []}
@@ -238,6 +244,30 @@ def main() -> None:
           "拆开的两半**共用该镜文案**（它们讲的是同一段话）")
     check(any("复用" in n for n in d.notes),
           "拆出的两半同类目只有一张图 → 如实说明复用（画面观感等同不切）")
+
+    section("8b) 收口 · 拆镜**下沉到词边界**：整镜就是一整句且超长（句内无句边界）→ 切词")
+    shots_word = [
+        {"id": "s1", "label": "长句一镜", "needKind": "门头", "durationMs": 8000,
+         "copy": "开门的瞬间保温十二小时"},
+        {"id": "s2", "label": "人物", "needKind": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
+    ]
+    r = invoke("timeline_build", _ctx(shots=shots_word, deps={"tts": _seg([
+        (0, 8000, "开门的瞬间保温十二小时", [
+            (0, 2000, "开门的"), (2000, 4000, "瞬间"), (4000, 6000, "保温"), (6000, 8000, "十二小时"),
+        ]),
+        (8000, 10000, "上班族的早晨"),
+    ])}))
+    check(r.ok, "词级下沉拆分路径应 ok")
+    d = r.data
+    _dump(d)
+    segs = d.edl.tracks[0].segments
+    check(len(segs) == 3, f"8s 的整句一镜内部**无句边界** ⇒ 下沉到词边界一分为二 → 3 镜，实际 {len(segs)}")
+    check([(s.atMs, s.durationMs) for s in segs] == [(0, 4000), (4000, 4000), (8000, 2000)],
+          "切点落在**词边界** 4000ms 上（离中点最近、且两半各 ≥ 1.5s）")
+    check(segs[0].transition is None and segs[1].transition is None,
+          "词级拆出的两道边界都按硬切（未设转场）")
+    check(any("下沉到词边界" in n for n in d.notes),
+          "词级下沉须如实说明（该处切在句内、非句边界）")
 
     section("9) 转场：非拆分边界上的符号值原样落 EDL（厂商 ID 未登记 ⇒ render 侧回落硬切）")
     shots_tr = [

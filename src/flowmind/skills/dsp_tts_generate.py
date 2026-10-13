@@ -39,12 +39,28 @@ class TtsGenerateInput(DspBaseInput):
     speechRate: int = Field(default=0, description="语速 [-50, 100]")
 
 
+class VoWord(BaseModel):
+    """**词级**（token）实测时间戳（ms，距音频开始）——比句**更细**的实测边界。
+
+    透出给 ``timeline``：某镜实测超长、而其内部没有句边界可切时，``_dsp_align._split_point``
+    靠它把切点**下沉到词**（词边界同属实测 token，画面与配音仍逐帧对齐）。
+    来自豆包 ``subtitle.sentences[].words[]``；厂商未返回即**空表**（不臆造）。
+    """
+    atMs: int
+    durationMs: int
+    text: str
+
+
 class VoSegment(BaseModel):
-    """逐句实测时间戳（**时间线真源**：`_dsp_align` 靠它把句子归属到镜头；字幕也靠它）。"""
+    """逐句实测时间戳（**时间线真源**：`_dsp_align` 靠它把句子归属到镜头；字幕也靠它）。
+
+    ``words`` = 该句下的**词级** token（同级实测，供**句内切分下沉**）——可空。
+    """
     id: str
     atMs: int
     durationMs: int
     text: str
+    words: list[VoWord] = Field(default_factory=list)
 
 
 class TtsGenerateData(BaseModel):
@@ -93,7 +109,10 @@ def tts_generate(inp: TtsGenerateInput) -> SkillOutput[TtsGenerateData]:
     storage.put_bytes(key, audio.audio_bytes, content_type=audio.content_type)
 
     vo_segments = [
-        VoSegment(id=f"s{idx}", atMs=s.start_ms, durationMs=s.duration_ms, text=s.text)
+        VoSegment(
+            id=f"s{idx}", atMs=s.start_ms, durationMs=s.duration_ms, text=s.text,
+            words=[VoWord(atMs=w.start_ms, durationMs=w.duration_ms, text=w.text) for w in s.words],
+        )
         for idx, s in enumerate(audio.sentences, start=1)
     ]
     warnings: list[str] = []
@@ -120,8 +139,8 @@ def tts_generate(inp: TtsGenerateInput) -> SkillOutput[TtsGenerateData]:
             f"配音完成：{len(vo_segments)} 句 / {audio.duration_ms}ms（落 {key}）",
             causal_analysis=(
                 f"按逐镜文案出音轨（{len(inp.shots)} 镜，纯文案无时间轴控制）；"
-                "逐句时间戳取自 enable_subtitle 的 subtitle.sentences，"
-                "透出给 timeline 的 _dsp_align 作**时长真源**。"
+                "逐句时间戳取自 enable_subtitle 的 subtitle.sentences（含**词级 token**），"
+                "透出给 timeline 的 _dsp_align 作**时长真源**（长句内部无句边界时可下沉到词切分）。"
             ),
             risk_note=(
                 "配音结果有以上告警，请核对（音色 / 超限 / 估算偏差）。"

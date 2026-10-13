@@ -8,7 +8,7 @@
 展示：
 1. discover() 自动字段发现
 2. happy path：**无上游依赖**也跑通；`text_prompt` 是**纯文案**（旧「时间轴控制」已删）；
-   出音轨 + 逐句实测时间戳（+ 实测总时长）
+   出音轨 + 逐句实测时间戳（含**词级 token**）+ 实测总时长
 3. error：预计配音超单次合成上限 120s → 明确报错（需分片，当前未实现）
 4. error：无 shots（无文本可合成）→ abort
 
@@ -44,8 +44,20 @@ def _install_fakes() -> None:
         return tts_client.TtsAudio(
             audio_bytes=b"FAKE-MP3-BYTES", content_type="audio/mpeg",
             sentences=[
-                tts_client.VoSentence(start_ms=0, end_ms=2900, text="开门的瞬间"),
-                tts_client.VoSentence(start_ms=3000, end_ms=6000, text="保温 12 小时"),
+                tts_client.VoSentence(
+                    start_ms=0, end_ms=2900, text="开门的瞬间",
+                    words=[
+                        tts_client.VoWord(start_ms=0, end_ms=1400, text="开门"),
+                        tts_client.VoWord(start_ms=1400, end_ms=2900, text="的瞬间"),
+                    ],
+                ),
+                tts_client.VoSentence(
+                    start_ms=3000, end_ms=6000, text="保温 12 小时",
+                    words=[
+                        tts_client.VoWord(start_ms=3000, end_ms=4500, text="保温"),
+                        tts_client.VoWord(start_ms=4500, end_ms=6000, text="12 小时"),
+                    ],
+                ),
             ],
             duration_ms=6000, voice=speaker,
         )
@@ -92,6 +104,13 @@ def main() -> None:
     check(d.audioKey == "dsp/scratch/t1/run-demo-2/audio/voice.mp3", "音轨须落「音频夹」")
     check(d.durationMs == 6000, "durationMs = 厂商实测总长（时间线的收口依据）")
     check(len(d.voSegments) == 2, "两句 → 两个 voSegment")
+    check(d.voSegments[0].words and d.voSegments[0].words[0].text == "开门",
+          "voSegment 须带**词级 token**（供 timeline 的句内下沉切分）")
+    check(
+        [(w.atMs, w.durationMs, w.text) for w in d.voSegments[1].words]
+        == [(3000, 1500, "保温"), (4500, 1500, "12 小时")],
+        "词级 token 的 atMs/durationMs/text 逐条透出",
+    )
     check(
         _CALLS[0]["text_prompt"] == "开门的瞬间\n保温 12 小时",
         "text_prompt 必须是**纯文案**（各镜文案按 \\n 拼接）",

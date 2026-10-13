@@ -13,8 +13,9 @@
 
 **第二段 · 节奏收口 = 并镜 / 拆镜**（ADR-070）：镜头的「有几个、切在哪」由文案定，但文案没写好的
 地方由规则兜底（``_dsp_align.consolidate_shots``）——实测 < ``timeline_shot_min_ms`` 的镜并入相邻镜、
-> ``timeline_shot_max_ms`` 的镜在**其内部句边界**一分为二；收口后镜数越界只告警不夹取。
-**拆镜需要句边界**，故估算路径只可能并镜（如实说明）。
+> ``timeline_shot_max_ms`` 的镜在**其内部最近的合法边界**一分为二（**先句边界，句内下沉到词边界**）；
+收口后镜数越界只告警不夹取。
+**拆镜需要实测 token（句 / 词）边界**，故估算路径只可能并镜（如实说明）。
 
 **第三段 · 转场**（ADR-070）：写 ``segments[i].transition``（**符号名**，语义 = 该镜末尾桥接 i→i+1）。
 来源 = 下发镜头的 ``transitionAfter``；**但被拆开的镜，其内部那刀按硬切**（用户设的转场是给整镜末尾的）。
@@ -110,8 +111,24 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _word_rows(raw: object) -> tuple[align.AlignWord, ...]:
+    """``voSegments[].words[]`` → 词级实测 token（形状不对即丢弃该条，不臆造）。"""
+    if not isinstance(raw, list):
+        return ()
+    out: list[align.AlignWord] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        at = _int_or_none(item.get("atMs"))
+        dur = _int_or_none(item.get("durationMs"))
+        if at is None or dur is None:
+            continue
+        out.append(align.AlignWord(start_ms=at, end_ms=at + dur, text=str(item.get("text") or "")))
+    return tuple(out)
+
+
 def _sentence_rows(tts: dict[str, Any] | None) -> list[align.AlignSentence]:
-    """``deps.tts.voSegments`` → 对齐用的逐句实测轴（形状不对即丢弃该条，不臆造）。"""
+    """``deps.tts.voSegments`` → 对齐用的逐句实测轴（含**词级 token**；形状不对即丢弃该条，不臆造）。"""
     if not tts:
         return []
     rows = tts.get("voSegments")
@@ -125,7 +142,10 @@ def _sentence_rows(tts: dict[str, Any] | None) -> list[align.AlignSentence]:
         dur = _int_or_none(row.get("durationMs"))
         if at is None or dur is None:
             continue
-        out.append(align.AlignSentence(start_ms=at, end_ms=at + dur, text=str(row.get("text") or "")))
+        out.append(align.AlignSentence(
+            start_ms=at, end_ms=at + dur, text=str(row.get("text") or ""),
+            words=_word_rows(row.get("words")),
+        ))
     return out
 
 
@@ -190,7 +210,7 @@ def _resolve(
         limit_max=cfg.timeline_shot_limit_max,
     )
     if not sentences and cut.merged == 0 and cut.split == 0:
-        notes.append("估算路径无句边界 ⇒ **只可能并镜、不能拆镜**（拆镜需要逐句实测轴）。")
+        notes.append("估算路径无实测轴 ⇒ **只可能并镜、不能拆镜**（拆镜需要逐句/词实测边界）。")
     notes.extend(cut.warnings)
     return cut, total_ms, source, notes
 
@@ -328,7 +348,7 @@ def timeline_build(inp: TimelineBuildInput) -> SkillOutput[TimelineBuildData]:
                     if measured else
                     "无配音真值，按 shots[].durationMs 累加（已如实标注）；"
                 )
-                + f"收口（并 {cut.merged} / 拆 {cut.split}，切点都在句边界上）→ {len(cut.shots)} 镜；"
+                + f"收口（并 {cut.merged} / 拆 {cut.split}，切点都在实测 token 边界上）→ {len(cut.shots)} 镜；"
                 + f"选图顺序 clipKeys → needKind==category（相邻镜优先换图）→ 留空位；素材池 {len(materials)} 张。"
             ),
             risk_note=(

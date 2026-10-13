@@ -16,8 +16,8 @@
 
 ## 轨严格连续（画面与配音逐帧对齐）
 
-时间边界全部落在**句级轴**上：``durationMs_i = end_ms[q_i] − end_ms[q_{i−1}]``（第一镜自 0 起）、
-``atMs_i = atMs_{i−1} + durationMs_{i−1}``——句间停顿归**前**一镜（保持前镜画面）。
+时间边界落在**实测 token（句 / 词）轴**上：``durationMs_i = end_ms[q_i] − end_ms[q_{i−1}]``（第一镜自 0 起）、
+``atMs_i = atMs_{i−1} + durationMs_{i−1}``——token 间停顿归**前**一镜（保持前镜画面）。
 ``total_ms`` 即音频总长（末尾静默并入末镜），故**不存在「配音与时间线偏差」这个类别**
 （旧甲案靠自然语言求配音配合，才有 drift）。
 
@@ -26,7 +26,10 @@
 「有几个镜」由文案定，但**文案没写好的地方由规则兜底**（都在实测轴上做，故只能运行期做）：
 
 - **并镜**：实测 < ``min_ms``（默认 1500）的镜并入相邻镜——防「一句话一闪」。
-- **拆镜**：实测 > ``max_ms``（默认 6000）的镜在**其内部句边界**就近一分为二——防「一张图钉太久」。
+- **拆镜**：实测 > ``max_ms``（默认 6000）的镜在**其内部最近的合法边界**一分为二——防「一张图钉太久」。
+  **两级下沉**（``_split_point``）：一级切**句边界**（句间停顿，观感最干净）；一级切不出（典型 =
+  该镜就是一整句且超长）则**下沉到词边界**（厂商词级 token）；连词级 token 都没有时才真的「不拆」。
+  切点永远是**实测** token 边界 ⇒ 画面与配音仍逐帧对齐。
 - 收口后镜数越界 ``[2, 10]`` 时**只告警、不夹取**（数据诚实）；终版镜的 id 重排为 ``s1..sK``，
   故下游**必须**读 EDL 的 ``shots[].copy``（``timeline`` 已把文案落进 EDL），**不得回查 ``inp.shots``**。
 
@@ -64,11 +67,27 @@ class AlignShot:
 
 
 @dataclass(frozen=True)
-class AlignSentence:
-    """配音的**逐句实测**时间轴（来自厂商 ``subtitle.sentences``，非估算）。"""
+class AlignWord:
+    """**词级**（token）实测边界（来自厂商 ``subtitle.sentences[].words[]``，与句级同形）。
+
+    用途单一：某镜实测超过上限、而其**内部没有句边界**可切时，切点**下沉到词**
+    ——词边界同为**实测** token，故「画面与配音逐帧对齐」不受影响（只是切得更细）。
+    """
     start_ms: int
     end_ms: int
     text: str
+
+
+@dataclass(frozen=True)
+class AlignSentence:
+    """配音的**逐句实测**时间轴（来自厂商 ``subtitle.sentences``，非估算）。
+
+    ``words`` = 该句的**词级** token（可空）——供 ``consolidate_shots`` 的**词级切分**下沉。
+    """
+    start_ms: int
+    end_ms: int
+    text: str
+    words: tuple[AlignWord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -465,11 +484,13 @@ def consolidate_shots(
     """**节奏收口**（ADR-070 的 L2）：按**实测**时长把分镜并/拆成终版镜头。
 
     - **并镜**：实测 < ``min_ms`` 的镜并入相邻镜（一次没够就继续并）——防「一句话一闪」。
-    - **拆镜**：实测 > ``max_ms`` 的镜在**其内部句边界**就近一分为二——防「一张图钉死太久」。
-      拆点只落在**句子起点**上（停顿归前一半，与 ``align_sentences_to_shots`` 的连续口径一致），
-      且两半都尽量 ≥ ``min_ms``；找不到合适的内部句边界就**不拆**（如实告警）。
+    - **拆镜**：实测 > ``max_ms`` 的镜在**其内部最近的合法边界**一分为二——防「一张图钉死太久」。
+      **两级下沉**（``_split_point``）：一级切**句边界**（句间停顿，观感最干净）；一级切不出则
+      **下沉到词边界**（厂商词级 token）。拆点取后半段首个 token 起点（停顿归前一半，与
+      ``align_sentences_to_shots`` 的连续口径一致），且两半都尽量 ≥ ``min_ms``；
+      句、词边界都没有合适的就**不拆**（如实告警）。
 
-    切点**永远落在句边界上** ⇒ 画面与配音仍逐帧对齐（ADR-069 的承重结构不动）。
+    切点**永远落在实测 token（句 / 词）边界上** ⇒ 画面与配音仍逐帧对齐（ADR-069 的承重结构不动）。
     收口后镜数越界 ``[limit_min, limit_max]`` 时**只告警、不夹取**（数据诚实）。
     ``shots`` 与 ``spans`` 必须**索引对齐**（``spans`` 由 ``align_sentences_to_shots`` 产出）。
     """
@@ -486,6 +507,8 @@ def consolidate_shots(
     final_spans: list[ShotSpan] = []
     group_of: list[int] = []  # 每个终版镜头来自哪个输入镜组（用于推导边界成因）
     split_count = 0
+    sentence_splits = 0  # 其中切在**句边界**上的
+    word_splits = 0      # 其中**下沉到词边界**的（该处内部无句边界）
 
     for gi, group in enumerate(groups):
         at = spans[group[0]].atMs
@@ -507,12 +530,15 @@ def consolidate_shots(
             transition_after=shots[group[-1]].transition_after,  # 转场只属于**整镜末尾**
         )
 
-        # ── 拆镜：只在「整组超长」且找得到合适合法内部句边界时拆（一刀） ──
-        piece = _split_at_sentence(sentences, at, dur, lo) if dur > hi else None
+        # ── 拆镜：整组超长时，在内部**最近的合法边界**一分为二（先句边界，句内下沉到词边界） ──
+        piece: int | None = None
+        boundary_kind: str | None = None
+        if dur > hi:
+            piece, boundary_kind = _split_point(sentences, at, dur, lo)
         if dur > hi and piece is None:
             warnings.append(
                 f"镜头 {shots[dominant].id} 实测 {dur}ms 超过上限 {hi}ms，"
-                f"但其内部没有可用的句边界（或拆开后两半都不足 {lo}ms）——**不拆**，如实保留。"
+                f"但其内部没有可用的句/词边界（或拆开后两半都不足 {lo}ms）——**不拆**，如实保留。"
             )
         if piece is not None:
             first_dur = piece - at
@@ -524,6 +550,10 @@ def consolidate_shots(
             final_spans.append(ShotSpan("", at + first_dur, second_dur, 0, spans[group[-1]].matched, spans[group[-1]].silent))
             group_of.extend([gi, gi])
             split_count += 1
+            if boundary_kind == "word":
+                word_splits += 1
+            else:
+                sentence_splits += 1
             continue
 
         final_shots.append(base)
@@ -551,7 +581,14 @@ def consolidate_shots(
     if merged:
         warnings.append(f"并镜 {merged} 个：实测不足 {lo}ms 的镜已并入相邻镜（切点仍在句边界上）。")
     if split_count:
-        warnings.append(f"拆镜 {split_count} 个：实测超过 {hi}ms 的镜已在其内部句边界一分为二。")
+        parts: list[str] = []
+        if sentence_splits:
+            parts.append(f"{sentence_splits} 处切在句边界")
+        if word_splits:
+            parts.append(f"{word_splits} 处**下沉到词边界**（该处内部无句边界）")
+        warnings.append(
+            f"拆镜 {split_count} 个：实测超过 {hi}ms 的镜已在其内部一分为二——{'、'.join(parts)}。"
+        )
     if k < limit_min or k > limit_max:
         warnings.append(
             f"收口后镜头数 {k} 越界 [{limit_min}, {limit_max}]——**如实报出、不静默夹取**，"
@@ -561,26 +598,43 @@ def consolidate_shots(
     return CutResult(final_shots, final_spans, warnings, merged, split_count, kinds)
 
 
-def _split_at_sentence(
+def _split_point(
     sentences: Sequence[AlignSentence], at_ms: int, dur_ms: int, min_ms: int
-) -> int | None:
-    """在 ``[at_ms, at_ms+dur_ms)`` 内找**最近的合法内部句边界**（返回切点 ms）。
+) -> tuple[int | None, str | None]:
+    """在 ``[at_ms, at_ms+dur_ms)`` 内找**最近的合法内部边界** → ``(切点ms, 边界类型)``。
 
-    切点取「后半段第一句的起点」（⇒ 句间停顿归**前**一半，与连续口径一致）。
-    合法性：两半都 ≥ ``min_ms``。找不到返回 ``None``（该镜不拆）。
+    两级（**先句后词** = 「下沉」）：
+
+    1. **句边界**（一级）：内部**句起点**里取离 ``mid`` 最近者。切在句间停顿上，画面观感最干净。
+    2. **词边界**（二级 · 下沉）：内部**句内词起点**里取离 ``mid`` 最近者。**仅当一级无合法切点时启用**
+       ——典型场景 = 该镜就是一整句且超长（句级切不出任何内部边界，只能切词）；厂商未返回词级
+       token 时自然退化为「仍不拆」。
+
+    合法性：两半都 ≥ ``min_ms``。都找不到返回 ``(None, None)``（该镜不拆）。
+    切点取「后半段第一个 token 的起点」⇒ token 间停顿归**前**一半
+    （与 ``align_sentences_to_shots`` 的连续口径一致），故画面与配音仍逐帧对齐。
     """
     mid = at_ms + dur_ms / 2
     end = at_ms + dur_ms
-    best: int | None = None
-    best_gap = None
-    for s in sentences:
-        cut = s.start_ms
-        if cut <= at_ms or cut >= end:
-            continue  # 不是**内部**边界
-        if cut - at_ms < min_ms or end - cut < min_ms:
-            continue  # 拆开后有半段太短
-        gap = abs(cut - mid)
-        if best_gap is None or gap < best_gap:
-            best, best_gap = cut, gap
-    return best
+
+    def nearest(cuts: Sequence[int]) -> int | None:
+        best: int | None = None
+        best_gap: float | None = None
+        for cut in cuts:
+            if cut <= at_ms or cut >= end:
+                continue  # 不是**内部**边界
+            if cut - at_ms < min_ms or end - cut < min_ms:
+                continue  # 拆开后有半段太短
+            gap = abs(cut - mid)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = cut, gap
+        return best
+
+    cut = nearest([s.start_ms for s in sentences])
+    if cut is not None:
+        return cut, "sentence"
+    cut = nearest([w.start_ms for s in sentences for w in s.words])
+    if cut is not None:
+        return cut, "word"
+    return None, None
 
