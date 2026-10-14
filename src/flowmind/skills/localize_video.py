@@ -707,38 +707,31 @@ def _est_text_width(text: str, font_size: int) -> float:
 
 
 def _fit_subtitle(text: str, base_fs: int, play_res_w: int = 1280,
-                  margin_lr: int = 120, min_fs: int = 14) -> tuple[int, str]:
-    """按文字长度动态匹配字号，返回 (font_size, 可能折行的 text)。
-
-    策略：先整句逐步缩号（下限 min_fs）；仍放不下则在句中找断点
-    （优先标点/空格，其次几何中点）折两行，再缩号到放下。
-    """
+                  margin_lr: int = 120) -> tuple[int, str]:
+    """保持统一字号，按单词换行；无空格长词按字符折行。"""
     safe_w = play_res_w - margin_lr * 2
-    if _est_text_width(text, base_fs) <= safe_w:
-        return base_fs, text
-    # 单行缩号
-    fs = base_fs
-    while fs > min_fs and _est_text_width(text, fs) > safe_w:
-        fs -= 1
-    if _est_text_width(text, fs) <= safe_w:
-        return fs, text
-    # 两行折行：从几何中点向外找最近的断点字符
-    mid = len(text) // 2
-    split = None
-    for radius in range(len(text)):
-        for idx in (mid + radius, mid - radius):
-            if 0 < idx < len(text) and text[idx] in " ,.!?:;、，。！？：；-/）)":
-                split = idx + 1
-                break
-        if split is not None:
-            break
-    split = split or mid
-    l1, l2 = text[:split].strip(), text[split:].strip()
-    fs = base_fs
-    while fs > min_fs and max(_est_text_width(l1, fs),
-                              _est_text_width(l2, fs)) > safe_w:
-        fs -= 1
-    return fs, f"{l1}\\N{l2}"
+    lines: list[str] = []
+    line = ""
+    for word in text.split():
+        if _est_text_width(word, base_fs) > safe_w:
+            if line:
+                lines.append(line)
+                line = ""
+            for char in word:
+                if line and _est_text_width(line + char, base_fs) > safe_w:
+                    lines.append(line)
+                    line = ""
+                line += char
+            continue
+        candidate = f"{line} {word}".strip()
+        if line and _est_text_width(candidate, base_fs) > safe_w:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return base_fs, "\\N".join(lines)
 
 
 _FONT_CANDIDATES = ("Noto Sans CJK SC", "Noto Serif CJK SC",
@@ -801,7 +794,7 @@ def _write_ass(segments: list[dict], workdir: Path, cfg,
     """把译文句段写成 ASS 字幕（底部居中，带半透明底条）。
 
     字号/下边距动态匹配原字幕（regions=OCR 原始行框时按行高与行底推导）；
-    长句仍经 _fit_subtitle 缩号/折行防溢出（匹配字号为上限）。
+    长句经 _fit_subtitle 按固定字号折行，避免逐句字号跳变。
     regions 缺省回退 cfg.subtitle_font_size / 固定 MarginV=40。
     """
     base_fs, margin_v = _match_original_style(regions or [], width, height)
@@ -826,9 +819,8 @@ def _write_ass(segments: list[dict], workdir: Path, cfg,
         return f"{int(h):01d}:{int(m):02d}:{s:05.2f}"
 
     for seg in segments:
-        fs, text = _fit_subtitle(str(seg["text"]).replace("\n", " "), font_size)
-        styled = text if fs == font_size else f"{{\\fs{fs}}}{text}"
-        lines.append(f"Dialogue: 0,{ts(seg['begin'])},{ts(seg['end'])},Sub,{styled}")
+        _, text = _fit_subtitle(str(seg["text"]).replace("\n", " "), font_size)
+        lines.append(f"Dialogue: 0,{ts(seg['begin'])},{ts(seg['end'])},Sub,{text}")
     path = workdir / "subs.ass"
     path.write_text("\n".join(lines), encoding="utf-8")
     return str(path)
@@ -931,15 +923,17 @@ def _build_timed_audio(segments: list[dict], dubs: list[str], duration_s: float,
     # wav 命名按 zip 位置（而非 seg['index']）：调用方传入的 segments
     # 已是过滤后的 tts_segs（index 可能非连续/缺失），位置必唯一防覆盖
     for pos, (seg, dub) in enumerate(zip(segments, dubs)):
-        # mp3 → wav；配音比原句长时用 atempo 加速压到句时长内（上限 2 倍速，
-        # 再长接受轻微溢出，避免过度压缩变调）
+        # mp3 → wav；限制加速幅度，过长时保留轻微时间溢出而不赶词
         wav_p = str(tmp_dir / f"dub_{pos:04d}.wav")
         cmd = ["ffmpeg", "-y", "-i", dub]
         seg_dur = seg["end"] - seg["begin"]
+        filters = []
         if seg_dur > 0.3:
             tempo = _media.probe_media(dub)[0] / seg_dur
             if tempo > 1.02:  # 2% 以内不压，避免徒增变速伪影
-                cmd += ["-filter:a", f"atempo={min(tempo, 2.0):.4f}"]
+                filters.append(f"atempo={min(tempo, 1.25):.4f}")
+        filters.append("loudnorm=I=-18:TP=-2:LRA=7")
+        cmd += ["-filter:a", ",".join(filters)]
         cmd += ["-ac", "1", "-ar", "16000", wav_p]
         rc, _, err = _media.run_ffmpeg(cmd)
         if rc != 0:
