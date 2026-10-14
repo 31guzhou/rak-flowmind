@@ -1,11 +1,18 @@
 import unittest
 from unittest.mock import patch
 
+from flowmind.config import LocalizerConfig
 from flowmind.skills import _inpaint
 from flowmind.skills.localize_video import LocalizeVideoInput, _watermark_region
 
 
 class WatermarkRemovalTests(unittest.TestCase):
+    def test_local_asr_defaults_are_configured(self):
+        cfg = LocalizerConfig()
+
+        self.assertEqual(cfg.local_asr_model, "small")
+        self.assertEqual(cfg.local_asr_device, "cuda")
+
     def test_bbox_is_validated_and_mapped_to_pixels(self):
         bbox = (0.8, 0.02, 0.95, 0.08)
         inp = LocalizeVideoInput(video_path="input.mp4", watermark_bbox=bbox)
