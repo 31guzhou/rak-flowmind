@@ -89,6 +89,8 @@ class _Job(NamedTuple):
     image_key: str
     tail_key: str
     seconds: str
+    """运镜的**引擎参数**（ADR-076）。本聚合端点无运动字段 ⇒ 恒空；留着是给将来引擎透出参数的接口位。"""
+    motion_params: dict[str, object]
 
 
 def _presign(key: str) -> str:
@@ -207,6 +209,10 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     shots = list(edl.shots)
     jobs: list[_Job] = []
     fell_back = 0
+    motion_planned = 0   # 真下发运镜方案的镜数
+    no_motion = 0        # 按固定机位处理的镜数
+    motion_ignored = 0   # 有方案但因「运镜」开关关而未下发
+    switches = inp.switches
     for idx, shot in enumerate(shots):
         if not shot.imageSourceKey:
             warnings.append(f"镜头 {shot.id} 无图（timeline 已留空位）——跳过图生视频")
@@ -221,17 +227,37 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             continue
         if not visual:
             fell_back += 1
+        # **运镜（ADR-076）**：经引擎适配器并入 prompt。
+        # 「运镜」开关**关** ⇒ 逐镜下**固定机位**条款（图照做，只是别动镜头——注意这**不是**「不做 I2V」）；
+        # 开 ⇒ 用该镜的方案（缺方案 = 固定机位）。方案来自 **EDL**（并/拆后 id 会重排，回查 inp.shots 必错配）。
+        effective_motion = shot.motion if switches.motion else None
+        if shot.motion is not None and not switches.motion:
+            motion_ignored += 1
+        motion_phrase, motion_params = videogen.motion_expression(effective_motion)
+        if shot.motion is not None and switches.motion and not motion_phrase:
+            warnings.append(
+                f"镜头 {shot.id} 的运镜符号 {shot.motion.type!r} 未登记到引擎适配表——该镜按固定机位处理")
+        if motion_phrase and motion_phrase != videogen.MOTION_STATIC_CLAUSE:
+            motion_planned += 1
+        else:
+            no_motion += 1
         tail_key = _next_image_key(shots, idx) if cfg.videogen_bridge_next_image else ""
         jobs.append(_Job(
             shot_id=shot.id, at_ms=shot.atMs, duration_ms=shot.durationMs,
-            prompt=prompt + _PROMPT_NEGATIVE + cfg.videogen_prompt_suffix,
+            prompt=prompt + _PROMPT_NEGATIVE + motion_phrase + cfg.videogen_prompt_suffix,
             image_key=shot.imageSourceKey, tail_key=tail_key,
             seconds=videogen.seconds_str(shot.durationMs),
+            motion_params=motion_params,
         ))
     if fell_back:
         warnings.append(
             f"{fell_back} 个镜头没有画面提示词（visualPrompt），已**回落用口播文案**出 prompt——"
             "台词容易被模型画成画面字幕，建议在镜头剪辑页为这些镜补画面提示词（ADR-073）。")
+    if motion_ignored:
+        # 如实告警（不静默）：方案在 EDL 上、但「运镜」开关关着 ⇒ 本次按固定机位生成。
+        warnings.append(
+            f"{motion_ignored} 个镜头带运镜方案，但「运镜」开关已关——本次**未下发**这些方案"
+            "（按固定机位生成）；要启用请在镜头剪辑页打开「运镜」开关。")
     if inp.maxShots and len(jobs) > inp.maxShots:
         warnings.append(f"超过 maxShots={inp.maxShots}：仅生成前 {inp.maxShots} 镜（其余回落静图）")
         jobs = jobs[:inp.maxShots]
@@ -256,7 +282,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         try:
             task_id = videogen.submit(
                 cfg, prompt=job.prompt, image_url=image_url,
-                seconds=job.seconds, tail_image_url=tail_url)
+                seconds=job.seconds, tail_image_url=tail_url,
+                motion_params=job.motion_params)
         except videogen.DspVideoGenError as exc:
             warnings.append(f"镜头 {job.shot_id} 提交失败（{exc.category}）：{exc}——该镜回落静图")
             continue
@@ -289,7 +316,10 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     total_ms = sum(c.durationMs for c in clips)
     bridged = sum(1 for j in jobs if j.tail_key)
     extras = ([f"首尾帧桥 {bridged} 镜"] if bridged else []) + (
-        [f"输入降采样 {stats['downscaled']} 张"] if stats["downscaled"] else [])
+        [f"输入降采样 {stats['downscaled']} 张"] if stats["downscaled"] else []) + (
+        [f"运镜方案 {motion_planned} 镜"] if motion_planned else []) + (
+        [f"固定机位 {no_motion} 镜"] if no_motion else []) + (
+        [f"{motion_ignored} 镜有运镜方案但「运镜」开关已关，未下发"] if motion_ignored else [])
     return SkillOutput(
         data=ImageToVideoData(clips=clips, warnings=warnings),
         reasoning=[common.chain(
@@ -304,12 +334,17 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                 + (f"素材图超输出分辨率（{cfg.videogen_size}）的先**等比降采样**再下发"
                    f"（指南：输入超标易出指纹状纹理，ADR-074），共 {stats['downscaled']} 张；"
                    if stats["downscaled"] else "")
+                + "运镜（ADR-076）经**引擎适配器**并入 prompt："
+                + (f"本镜下发了运镜方案（{motion_planned} 镜）；" if motion_planned else "")
+                + (f"另有 {no_motion} 镜按**固定机位**下发；" if no_motion else "")
+                + (f"{motion_ignored} 镜带方案但因「运镜」开关关闭被忽略；" if motion_ignored else "")
+                + "（本聚合端点**没有**运动入参，运镜只能靠提示词语言表达——是否真被执行**待真跑验证**）"
                 + "直链（24h）已转存为不可变 key。"
             ),
             risk_note=(
                 f"{failed} 镜未出片，render 侧将回落静图（如实标注）。"
                 if failed else
-                "全部镜头已出片；render 侧对有运镜的镜头再叠加 apply-camera-motion。"
+                "全部镜头已出片；运镜已随本次生成落地（render 侧**不再**施加运镜——重复施加已退役）。"
             ),
         )],
         confidence=1.0 if not failed else 0.6,

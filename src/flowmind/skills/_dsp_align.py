@@ -49,6 +49,7 @@ from __future__ import annotations
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 # 无口播镜的展示时长（ms）——**显式常量**（非实测）。仅在「空隙不够」时使用。见模块 docstring。
 DEFAULT_SILENT_SHOT_MS = 1500
@@ -427,7 +428,11 @@ class CutShot:
     copy: str
     need_kind: str = ""
     clip_keys: tuple[str, ...] = ()
-    camera_motion: bool = False
+    """该镜的**运镜方案**（ADR-076「运镜导演」看图产出；``None`` = 摄影机固定）。
+    **并镜取主导镜的方案、拆镜两半共用**（同一画面意图），与 ``visual_prompt`` 同款语义。
+    ⚠️ 用 ``Any`` 而非 ``common.DspShotMotion``：本模块是**纯算法模块**（只依赖标准库 + 本文件），
+    引入 pydantic 模型会把它绑死在协议层——这里只需**原样搬运**该对象。"""
+    motion: Any = None
     """该镜的**画面提示词**（ADR-073；与 ``copy`` 口播文案分开）——喂图生视频模型的画面描述。
     **并镜 = 各镜画面描述按行拼接；拆镜 = 两半共用**（同一画面意图）。下游 ``image_to_video``
     优先用它出 prompt，缺则回落 ``copy`` 并如实告警。"""
@@ -517,7 +522,7 @@ def consolidate_shots(
     for gi, group in enumerate(groups):
         at = spans[group[0]].atMs
         dur = sum(spans[j].durationMs for j in group)
-        # 主导成员 = 实测最长的那一镜（决定类目与运镜；并镜后仍要有个明确的画面意图）
+        # 主导成员 = 实测最长的那一镜（决定画面意图、运镜与类目；并镜后仍要有个明确的表达）
         dominant = max(group, key=lambda j: spans[j].durationMs)
         copy = "".join(shots[j].copy for j in group)
         # 画面提示词（ADR-073）：并镜 = 各镜画面描述**按行拼接**（跳过空串）；拆镜时两半共用 base，自然继承
@@ -535,7 +540,7 @@ def consolidate_shots(
             visual_prompt=visual_prompt,
             need_kind=shots[dominant].need_kind,
             clip_keys=tuple(clip_keys),
-            camera_motion=shots[dominant].camera_motion,
+            motion=shots[dominant].motion,  # ADR-076：并镜取主导镜的运镜方案（拆镜两半共用）
             transition_after=shots[group[-1]].transition_after,  # 转场只属于**整镜末尾**
         )
 

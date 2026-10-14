@@ -13,6 +13,9 @@
 7. 降采样失败 → **回落原图**并如实告警（画质风险，**不丢镜**）
 8. 成本闸：maxShots 限制生成镜数
 9. 开关：``FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE=0`` / ``..._DOWNSCALE_INPUT=0``
+10. **运镜（ADR-076）**：经引擎适配器并入 prompt——「运镜」开关关 ⇒ 逐镜下**固定机位**条款；
+   开 ⇒ 用该镜方案（Agent 的 positive 优先、否则确定性短语）；有方案但开关关 ⇒ 忽略并如实告警；
+   词表外符号 ⇒ 空短语不硬凑；**引擎参数位恒空**（本聚合端点无运动入参）
 
 mock 方式：替换 ``_dsp_video_gen`` 的 submit/wait（模块级薄适配层）与 ``_dsp_storage``
 的 presign/fetch/put_file，不需要网络 / 厂商密钥 / 对象存储。密钥用假值经 env 注入。
@@ -63,9 +66,10 @@ def _write_image(dest_path: str, url: str) -> None:
 
 def _install_fakes() -> None:
     def submit(cfg, *, prompt: str, image_url: str, seconds: str,
-               tail_image_url: str = "") -> str:
+               tail_image_url: str = "", motion_params: dict | None = None) -> str:
         _SUBMITTED.append({"prompt": prompt, "image_url": image_url, "seconds": seconds,
-                           "tail_image_url": tail_image_url})
+                           "tail_image_url": tail_image_url,
+                           "motion_params": dict(motion_params or {})})
         return f"task_{len(_SUBMITTED)}"
 
     def wait(cfg, task_id: str, *, api_key: str = "") -> dict:
@@ -278,6 +282,74 @@ def main() -> None:
     check(not any("/i2v_input/" in k for k in _PUTS), "关降采样 ⇒ 不落派生件")
     check(_SUBMITTED[0]["image_url"].endswith("门店/门头1.jpg"), "关降采样 ⇒ 原图直发")
     os.environ.pop("FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT")
+
+    # ── 10) 运镜（ADR-076）：经引擎适配器并入 prompt ──
+    # 口径：**关**（缺省）= 图照做、要求摄影机固定；**开** = 下发逐镜方案（缺方案 = 固定机位）。
+    section("10) 运镜：适配器并入 prompt（关=固定机位 / 开=逐镜方案 / 词表外不硬凑）")
+
+    def _edl_with_motion(extra: dict, shot_id: str = "s1") -> dict:
+        """把运镜方案塞进 EDL 对应镜头——I2V **从 EDL 读**（并/拆会重排 id，回查 inp.shots 必错配）。"""
+        edl = _edl()
+        for shot in edl["timeline"]["edl"]["shots"]:
+            if shot["id"] == shot_id:
+                shot["motion"] = extra
+        return edl
+
+    plan = {"type": "push_in", "intensity": "subtle", "direction": "toward_subject",
+            "target": "门头", "reason": "留白充足", "positive": "", "negative": ""}
+
+    # 10a) 「运镜」开关**关** ⇒ 逐镜下固定机位条款（**不是**「不做 I2V」）
+    _reset()
+    r = invoke("image_to_video", _ctx(deps=_edl_with_motion(plan)))
+    check(r.ok and len(r.data.clips) == 2, "运镜关也不影响出片（图照做）")
+    print(f"  关运镜 prompt 尾部: ...{_SUBMITTED[0]['prompt'][-56:]}")
+    check(videogen.MOTION_STATIC_CLAUSE in _SUBMITTED[0]["prompt"],
+          "运镜关 ⇒ prompt 带**固定机位条款**")
+    check("保持固定" in _SUBMITTED[0]["prompt"] and "自然" in _SUBMITTED[0]["prompt"],
+          "条款含「保持固定」且**允许**自然动态（不越界到「画面动态强度」）")
+    check(any("开关已关" in w for w in r.data.warnings),
+          "有方案但运镜开关关 ⇒ 如实告警被忽略（不静默）")
+
+    # 10b) 「运镜」开关**开** ⇒ 用该镜方案；无 positive 时出确定性短语（运动 + 幅度 + 方向 + 焦点）
+    _reset()
+    r = invoke("image_to_video", _ctx(switches={"motion": True}, deps=_edl_with_motion(plan)))
+    p1 = _SUBMITTED[0]["prompt"]
+    print(f"  开运镜 s1 prompt 尾部: ...{p1[-64:]}")
+    check("推近" in p1 and "幅度轻微" in p1 and "朝主体" in p1 and "门头" in p1,
+          "无 positive ⇒ 适配器出确定性短语（运动+幅度+方向+焦点）")
+    check(videogen.MOTION_STATIC_CLAUSE in _SUBMITTED[1]["prompt"],
+          "同批里**没给方案**的镜仍按固定机位（逐镜粒度）")
+    # 计数是**结论里的摘要**（不是告警——告警只留「方案被开关忽略」那种需要动作的信号）
+    _concl = r.reasoning[0].conclusion
+    print(f"  结论摘要  : {_concl}")
+    check("运镜方案 1 镜" in _concl and "固定机位 1 镜" in _concl,
+          "结论如实报出「运镜方案 N 镜 / 固定机位 M 镜」")
+
+    # 10c) Agent 给了 positive ⇒ 优先用它（它看过图、能写到具体主体）
+    _reset()
+    invoke("image_to_video", _ctx(switches={"motion": True}, deps=_edl_with_motion(
+        plan | {"positive": "Slow, smooth camera push-in toward the shopfront."})))
+    check("Slow, smooth camera push-in toward the shopfront." in _SUBMITTED[0]["prompt"],
+          "Agent 的 positive 优先于确定性短语")
+
+    # 10d) 词表外符号 ⇒ 空短语（不硬凑）+ 如实告警；该镜不冒充方案
+    _reset()
+    r = invoke("image_to_video", _ctx(switches={"motion": True},
+                                      deps=_edl_with_motion(plan | {"type": "warp_speed"})))
+    check(any("未登记到引擎适配表" in w for w in r.data.warnings),
+          "词表外运镜符号 ⇒ 如实告警（不硬凑运动）")
+    check(videogen.MOTION_STATIC_CLAUSE not in _SUBMITTED[0]["prompt"]
+          and "warp_speed" not in _SUBMITTED[0]["prompt"],
+          "词表外符号既不下发也不冒充方案")
+
+    # 10e) **引擎参数位恒空**：本聚合端点没有运动入参 ⇒ 不往请求体塞自造字段
+    _reset()
+    invoke("image_to_video", _ctx(switches={"motion": True}, deps=_edl_with_motion(plan)))
+    check(all(item["motion_params"] == {} for item in _SUBMITTED),
+          "本引擎无运动入参 ⇒ motion_params 恒空（参数位留给将来引擎）")
+    check(videogen.motion_expression(None)[0] == videogen.MOTION_STATIC_CLAUSE,
+          "未给方案（None）也走固定机位条款——「不运镜」要明确告诉模型别动镜头")
+
 
     print("\n✅ dsp_image_to_video_demo 全部通过")
 

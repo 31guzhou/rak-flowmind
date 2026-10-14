@@ -102,19 +102,13 @@ def mediakit_configured(cfg: DspConfig) -> bool:
     return bool(get_api_key(cfg.mediakit_key_env))
 
 
-# ── 运镜（apply-camera-motion · 契约 §7.5 第 2 步）──────────────────
-# 文档核实（docs/vendor/智能处理_视频添加运镜_1785416057.pdf）：`apply-camera-motion`
-# **只接受视频**（`video_url`），故运镜必须在「图片已成视频」之后——本仓由 `video` 节点
-# （图生视频）产片段，render 侧再对片段加运镜。
-MOTION_STYLES: tuple[str, ...] = ("zoom", "pan-zoom", "orbit-360", "bounce")
-# 本仓 EDL ``effect`` → MediaKit ``motion_style``（与前端 dsp-steps.ts 的
-# DSP_EFFECT_VENDOR_MOTION 同口径：kenburns → pan-zoom）。
-EFFECT_MOTION_STYLE: dict[str, str] = {"kenburns": "pan-zoom"}
-
-
-def motion_style_for(effect: str | None) -> str:
-    """EDL ``effect`` → MediaKit ``motion_style``；未登记即返回空串（调用方如实标注）。"""
-    return EFFECT_MOTION_STYLE.get((effect or "").strip(), "")
+# ── 运镜：整块退役（ADR-076）────────────────────────────────────
+# 旧路径 = 对**已生成片段**调 MediaKit `apply-camera-motion` 做事后 pan-zoom（契约 §7.5 第 2 步）。
+# 2026-10-14 改判：运镜改由「运镜导演」产出结构化方案 → `image_to_video` 经引擎适配器**并入 prompt、
+# 随生成一起落地**（新单点适配表 = `_dsp_video_gen.MOTION_ENGINE`）。故本文件的 `MOTION_STYLES` /
+# `EFFECT_MOTION_STYLE` / `motion_style_for` / `apply_camera_motion` **全部删除**——留着就会
+# 「同一运动施加两次」（ADR-073 当初禁止把运镜写进 prompt，正是为了防这个）。
+# 将来若要用引擎**参数级**运镜，落点同样是 `_dsp_video_gen.MOTION_ENGINE`。
 
 
 # ── 转场（extra 滤镜 · ADR-070）──────────────────────────────────
@@ -450,44 +444,4 @@ def _wait_result(cfg: DspConfig, api_key: str, task_id: str, *, label: str) -> d
         time.sleep(cfg.mediakit_poll_interval_s)
 
 
-def apply_camera_motion(
-    cfg: DspConfig, *, video_url: str, motion_style: str,
-    start_s: float | None = None, end_s: float | None = None,
-) -> dict:
-    """对**视频**加运镜（§7.5 第 2 步），返回 ``result``（``{video_url, duration, resolution}``）。
-
-    文档核实（``docs/vendor/智能处理_视频添加运镜_1785416057.pdf``）：
-    - 入参 ``video_url`` **只接受视频**（故必须跑在「图片已成视频」之后）；
-    - ``motion_style`` ∈ :data:`MOTION_STYLES`；
-    - ``start_time`` / ``end_time`` 单位**秒**（可小数），缺省 = 叠加到整段；
-    - 异步任务（提交返 ``task_id`` → 轮询 ``completed``）；输出固定 MP4、**分辨率对齐原片**。
-
-    与 :func:`render` 同服务、同集群 Secret、同 ``task_id`` 轮询口径。
-    """
-    api_key = get_api_key(cfg.mediakit_key_env)
-    if not api_key:
-        raise DspMediakitError(
-            f"未配置 MediaKit 密钥 {cfg.mediakit_key_env}（运镜必需）。", category="environment")
-    if not video_url:
-        raise DspMediakitError("运镜需要视频底（video_url 为空）。", category="video")
-    if motion_style not in MOTION_STYLES:
-        raise DspMediakitError(
-            f"未知运镜样式 {motion_style!r}（可选：{'/'.join(MOTION_STYLES)}）", category="video")
-
-    body: dict = {"video_url": video_url, "motion_style": motion_style}
-    if start_s is not None:
-        body["start_time"] = float(start_s)
-    if end_s is not None:
-        body["end_time"] = float(end_s)
-
-    raw = _post(cfg, api_key, cfg.mediakit_camera_motion_path, body)
-    if not raw.get("success", True):
-        code, message = _mk_error(raw)
-        category, retriable = _classify_mk_error(code)
-        raise DspMediakitError(
-            f"运镜提交失败：{code} {message}".strip(), category=category, retriable=retriable)
-    task_id = raw.get("task_id") or raw.get("data", {}).get("task_id")
-    if not task_id:
-        raise DspMediakitError(
-            f"运镜响应缺少 task_id：{sorted(raw)[:12]}", category="video")
-    return _wait_result(cfg, api_key, str(task_id), label="运镜")
+# 运镜（`apply_camera_motion`）已整块退役 —— 见本文件上方「运镜：整块退役」说明（ADR-076）。

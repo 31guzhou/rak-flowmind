@@ -81,6 +81,54 @@ def step_key(cache_prefix: str, run_id: str, step_id: str, filename: str) -> str
 
 # ── 入参模型（§2.2）─────────────────────────────────────────────
 
+# 运镜**符号**词表（与前端 `lib/content/dsp-motion.ts` 的 `DSP_MOTION_TYPES` **同源同值**）：
+# 那边是产物侧真源（并带符号 → 引擎表达的单点适配表），本侧只**消费**——改一处必改另一处，
+# 同「转场资源 ID 两处同源」的纪律。故意**不做** pydantic 枚举校验：词表外只让适配器**如实回落**
+# （见 `_dsp_video_gen.motion_expression`），不因一个逐镜参数把整步调用打挂。
+MOTION_TYPES: tuple[str, ...] = (
+    "none", "push_in", "pull_out", "pan_left", "pan_right",
+    "tilt_up", "tilt_down", "zoom_in", "zoom_out", "orbit",
+)
+MOTION_INTENSITIES: tuple[str, ...] = ("minimal", "subtle", "standard", "strong")
+
+
+class DspShotMotion(BaseModel):
+    """单镜的**运镜方案**（ADR-076「运镜导演」）。
+
+    符号词表与引擎适配真源在前端 `lib/content/dsp-motion.ts`（**同源同值**：那边的
+    `DSP_MOTION_TYPES` 与本文件 `MOTION_TYPES` 是同一份符号集，改一处必改另一处——
+    与转场资源 ID「两处同源同值」同一纪律）。本侧只**消费**：把符号经适配器
+    （`_dsp_video_gen.motion_expression`）转成该引擎的表达。
+
+    **缺省（None / 上游没给）= 摄影机固定**，不是「没有这个字段」。
+    """
+
+    type: str = Field(..., description="运镜符号：none / push_in / pull_out / pan_left / pan_right / "
+                                       "tilt_up / tilt_down / zoom_in / zoom_out / orbit")
+    intensity: str = Field(..., description="幅度：minimal（极轻，『不宜明显运镜』时的落法）/ subtle / standard / strong")
+    direction: str | None = Field(default=None, description="方向：toward_subject / away_from_subject / "
+                                                           "left_to_right / right_to_left / none")
+    target: str | None = Field(default=None, description="视觉焦点（如 coffee_cup）")
+    reason: str = Field(default="", description="**判断依据**（为什么这么运镜 / 为什么不宜明显运镜）")
+    positive: str = Field(default="", description="Agent 给引擎的**正向**运动描述（空则适配器出确定性短语）")
+    negative: str = Field(default="", description="给引擎的**负向**约束（防变形/改标签/闪烁/突然变焦/新增物体）")
+    locked: bool = Field(default=False, description="人工锁定：重跑与重分析**不得覆盖**（导演员会跳过该镜）")
+
+
+class DspSwitches(BaseModel):
+    """本单的**开关整组**（ADR-076 起随公共 args 下发，不再只靠「哪些节点在场」表达）。
+
+    为什么要有它：`motion` **不 gate 任何节点**（运镜是逐镜参数不是工序），后端无从「数节点」得知
+    运镜开没开——而 `image_to_video` 必须知道（关 ⇒ 逐镜下**固定机位**条款；开 ⇒ 下发逐镜方案）。
+    缺省按各开关的缺省给（tts/bgm/video 开、motion 关）。
+    """
+
+    tts: bool = True
+    bgm: bool = True
+    video: bool = True
+    motion: bool = False
+
+
 class DspShot(BaseModel):
     """单个**镜头单元**（ADR-070：文案按视觉信息点切出来的一段）+ 逐句文案 + 需要的**图片**类目。"""
 
@@ -103,7 +151,10 @@ class DspShot(BaseModel):
                     "**画面描述**（主体 + 动作 + 环境光线 + 景别机位 + 风格），**不是台词**。"
                     "空串 = 未给 ⇒ 下游回落用 `copy` 出 prompt 并**如实告警**（绝不假装有画面提示词）")
     clipKeys: list[str] = Field(default_factory=list, description="指名的图片 key（优先于 needKind 选图）")
-    cameraMotion: bool = Field(default=False, description="运镜（Ken Burns）：落 EDL segment 的 effect")
+    motion: DspShotMotion | None = Field(
+        default=None,
+        description="该镜的**运镜方案**（ADR-076）。**缺省 = 摄影机固定**；`locked: true` = 人工锁定。"
+                    "由前端「运镜导演」**看图**产出（旧布尔 `cameraMotion` 已退役）")
     transitionAfter: str | None = Field(
         default=None,
         description="该镜**末尾**的转场覆盖（ADR-070；符号名，如 `dissolve`）——缺省 = 硬切（不写字段）。"
@@ -140,6 +191,10 @@ class DspBaseInput(BaseModel):
     productInfo: str = Field(default="", description="仅带货：出文案的商品信息单行事实文本")
     cachePrefix: str = Field(..., description="工作缓存目录（云存储 prefix）")
     outputPrefix: str = Field(..., description="成片目录（云存储 prefix）")
+    switches: DspSwitches = Field(
+        default_factory=DspSwitches,
+        description="本单**开关整组**（ADR-076，随公共 args 下发）。`motion` 不 gate 任何节点，"
+                    "故只能这样传——`image_to_video` 靠它决定「关 ⇒ 固定机位条款」还是「开 ⇒ 下发运镜方案」")
 
     # ── 运行器注入（每步都有）──
     runId: str = Field(..., description="本单运行 id（对象 key 的命名空间）")
@@ -155,7 +210,6 @@ class DspEdlSegment(BaseModel):
     atMs: int
     durationMs: int
     sourceKey: str = ""
-    effect: str | None = Field(default=None, description='运镜："kenburns"（由镜头 cameraMotion 决定）')
     transition: str | None = Field(
         default=None,
         description="**转场**（符号名，ADR-070）——语义 = **本段末尾、桥接下一段**（对齐厂商「加到相邻两元素的"
@@ -186,6 +240,11 @@ class DspEdlShot(BaseModel):
         description="**该终版镜头**的**画面提示词**（ADR-073；并镜=按行拼接、拆镜=两半共用）。"
                     "`image_to_video` 优先用它出 prompt，缺则回落 `copy` 并如实告警")
     needKind: str = Field(default="", description="该终版镜头需要的图片类目（并镜取其一，仅供诊断）")
+    motion: DspShotMotion | None = Field(
+        default=None,
+        description="**该终版镜头**的运镜方案（ADR-076；并镜取**主导镜**、拆镜两半共用）。"
+                    "`image_to_video` 据此经适配器并入 prompt；None = 摄影机固定。"
+                    "**放在 EDL 而非回查 inp.shots**：并/拆会重排 id，回查必然错配（同 copy/visualPrompt 的理由）")
 
 
 class DspEdl(BaseModel):

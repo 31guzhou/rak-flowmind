@@ -3,16 +3,15 @@
 契约 §3.7：依赖 ``tts`` / ``timeline`` / ``bgm`` / ``subtitle`` / ``cover`` / ``cart``
 （**缺席者按裁剪后的依赖表传入**）；降级 **abort**；风险 **L1**。
 
-职责：按 EDL 铺 **主轨（图生视频片段 ``video`` / 静图 ``image``）+ 音轨**，把运镜 /
-字幕 / 贴片 / 封面位**一次性烧制**，成片 mp4 落**成片目录**（契约 §2.4：
-``{outputPrefix}/{runId}/final.mp4``）。
+职责：按 EDL 铺 **主轨（图生视频片段 ``video`` / 静图 ``image``）+ 音轨**，把字幕 / 贴片 /
+封面位**一次性烧制**，成片 mp4 落**成片目录**（契约 §2.4：``{outputPrefix}/{runId}/final.mp4``）。
+**运镜不在这里做**（ADR-076）。
 
 关键契约点：
 - §7.3② **成片必须转存**：MediaKit 的 ``result.video_url`` 是 **24h 签名 URL**，
   **不得**直接当 ``storedKey``；须落 ``{outputPrefix}/{runId}/final.mp4`` 再回 key。
-- §7.3②（同款）**运镜产物也必须转存**：见 ``_motion_to_storage``。
-- §7.5 **运镜两步**：本仓第 1 步（图→视频）由 ``video`` 节点承担，本步做第 2 步
-  （``apply-camera-motion``）——**只对拿到片段的镜头**，无片段者如实标注。
+- **运镜（ADR-076 改判）**：运镜已由 ``image_to_video`` 经引擎适配器并入 prompt **随生成落地**；
+  本步**不再施加**（旧的 MediaKit ``apply-camera-motion`` 事后 pan-zoom 已退役——重复施加会叠加两次运动）。
 - §7.1 素材经**预签名 URL**（同源 ``/api/assets`` 火山拉不到，须换成可达引用）。
 - §7.3④ AIGC 标识：``extra_param.upload.aigc_meta`` 由 MediaKit 客户端注入。
 
@@ -73,25 +72,11 @@ def _split_stickers(raw: object) -> tuple[list[dict], list[str]]:
     return burnable, notes
 
 
-def _motion_to_storage(cfg, inp: RenderComposeInput, shot_id: str,
-                       clip_key: str, style: str) -> str:
-    """对片段加运镜（``apply-camera-motion``）并**转存**回自有对象存储，返回新 key。
-
-    §7.3② 同款纪律：运镜返回的 ``result.video_url`` 是 **24h 签名 URL**，**不得**当 key
-    直接交给最终渲染（会过期）——必须先落自有存储，再对 key 预签名。
-    """
-    result = mediakit.apply_camera_motion(
-        cfg, video_url=_presign(clip_key), motion_style=style)
-    url = str(result.get("video_url") or "")
-    if not url.startswith(("http://", "https://")):
-        raise mediakit.DspMediakitError(
-            f"运镜返回的地址不可取用（{url[:80]}）——本仓只支持 http(s) 结果的下载-转存。",
-            category="environment")
-    dest = common.step_key(inp.cachePrefix, inp.runId, "motion", f"{shot_id}.mp4")
-    with tempfile.TemporaryDirectory(prefix="dsp-motion-") as tmp:
-        local = storage.fetch_to_file(url, str(Path(tmp) / f"{shot_id}.mp4"))
-        storage.put_file(local, dest, content_type="video/mp4")
-    return dest
+# **运镜施加已退役**（ADR-076）：旧路径 `apply-camera-motion` 是对**已生成片段**做事后 pan-zoom，
+# 而运镜现已由「运镜导演」产出方案、经适配器并入 I2V prompt **随生成一起落地**——本侧再施加就是
+# **同一运动施加两次**（ADR-073 当初正是为此才禁止把运镜写进 prompt）。故整段删除，不留死代码。
+# MediaKit 的 `apply_camera_motion` / `MOTION_STYLES` / `EFFECT_MOTION_STYLE` / `motion_style_for`
+# 一并退役（见 `_dsp_mediakit.py`）；将来若要用引擎**参数级**运镜，落点是 `_dsp_video_gen.MOTION_ENGINE`。
 
 
 @skill(id="render_compose", name="合成渲染", version=_VERSION,
@@ -119,44 +104,12 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
         str(c.get("shotId")): c for c in clips if c.get("shotId") and c.get("key")
     }
 
-    # 镜头 id → EDL effect（``edl.shots`` 与 image 轨 segments **索引对齐**）
-    image_track = next((t for t in edl.tracks if t.kind == "image"), None)
-    segs = image_track.segments if image_track else []
-    effect_by_shot = {
-        shot.id: (segs[i].effect if i < len(segs) else None)
-        for i, shot in enumerate(edl.shots)
-    }
-
-    # 运镜（契约 §7.5 第 2 步）：真文档核实 apply-camera-motion **只接受视频**
-    # （``docs/vendor/智能处理_视频添加运镜_1785416057.pdf``）——故只有拿到片段的镜头
-    # 才能运镜；无片段的镜头**如实标注**，不静默丢弃。
+    # 主轨：有 I2V 片段的镜头用片段、其余回落静图。**运镜不在这里施加**（ADR-076：已随生成落地）。
     clip_urls: dict[str, str] = {}
-    motion_applied = 0
     for shot_id, clip in clip_by_shot.items():
-        key = str(clip["key"])
-        effect = effect_by_shot.get(shot_id)
-        if effect:
-            style = mediakit.motion_style_for(effect)
-            if not style:
-                warnings.append(
-                    f"镜头 {shot_id} 的运镜 {effect!r} 未登记到 MediaKit motion_style——该镜跳过运镜"
-                )
-            else:
-                key = _motion_to_storage(cfg, inp, shot_id, key, style)
-                motion_applied += 1
-        clip_urls[shot_id] = _presign(key)
+        clip_urls[shot_id] = _presign(str(clip["key"]))
     if clip_urls:
-        warnings.append(f"主轨用图生视频片段：{len(clip_urls)} 镜（其中 {motion_applied} 镜已加运镜）")
-
-    no_clip_motion = [
-        shot_id for shot_id, effect in effect_by_shot.items()
-        if effect and shot_id not in clip_by_shot
-    ]
-    if no_clip_motion:
-        warnings.append(
-            f"EDL 含 {len(no_clip_motion)} 个镜头标了运镜（effect），但这些镜头没有视频片段"
-            "（video 节点未生成 / 该镜未出片）——运镜需先有视频底，这些镜头成片无运镜"
-        )
+        warnings.append(f"主轨用图生视频片段：{len(clip_urls)} 镜")
 
     # 静图轨：仅无片段（或片段缺失）的镜头需要其图
     still_keys = {
@@ -252,8 +205,7 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
             f"合成渲染完成：{final}（{duration_ms}ms，{cfg.mediakit_canvas_width}×{cfg.mediakit_canvas_height}）",
             causal_analysis=(
                 f"按锁定 EDL（totalMs={edl.totalMs}ms）铺 {len(tracks)} 轨；"
-                f"主轨 {len(clip_urls)} 段视频片段（其中 {motion_applied} 段加运镜）"
-                f" + {len(still_keys)} 张静图；"
+                f"主轨 {len(clip_urls)} 段视频片段 + {len(still_keys)} 张静图；"
                 "字幕/贴片/封面位一次性烧制；AIGC 标识元数据已注入。"
             ),
             risk_note=(

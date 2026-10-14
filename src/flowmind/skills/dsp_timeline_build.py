@@ -21,8 +21,14 @@
 来源 = 下发镜头的 ``transitionAfter``；**但被拆开的镜，其内部那刀按硬切**（用户设的转场是给整镜末尾的）。
 厂商资源 ID 未登记时由 ``render_compose`` 如实回落硬切并告警——本步只忠实记录符号值。
 
-**终版镜头自带文案**：收口会并/拆镜并重排 id（``s1..sK``），故每镜的 ``copy`` / ``needKind``
-一并落进 ``edl.shots[]``——下游（I2V 提示词等）**一律读 EDL**，不再回查 ``inp.shots``（否则必然错配）。
+**终版镜头自带文案与运镜**：收口会并/拆镜并重排 id（``s1..sK``），故每镜的 ``copy`` / ``needKind`` /
+``motion`` 一并落进 ``edl.shots[]``——下游（I2V 提示词与运镜等）**一律读 EDL**，不再回查 ``inp.shots``
+（否则并/拆后必然错配）。
+
+**运镜（ADR-076）**：**不再往 segment 写 ``effect``**。运镜是**逐镜结构化方案**（前端「运镜导演」
+**看图**产出，含 type/intensity/direction/target/reason/正负提示词），**原样搬运**到
+``edl.shots[].motion``，由 ``image_to_video`` 经引擎适配器并入 prompt——**render 侧不再施加运镜**
+（旧 MediaKit ``apply-camera-motion`` 路径已退役，留着就是同一运动施加两次）。
 
 选图口径（契约 §3.2，**不臆造素材**）：
 1. 镜头给了 ``clipKeys`` → 用指名的图；
@@ -50,9 +56,6 @@ from flowmind.skills import _dsp_storage as storage
 from flowmind.skills._dsp_common import DspBaseInput
 
 _VERSION = "0.3.0"
-
-# EDL 图片轨 segment 的运镜取值：Ken Burns（推近 + 平移）。render 侧两步落地（§7.5）。
-EFFECT_KENBURNS = "kenburns"
 
 DurationSource = Literal["measured", "estimated"]
 
@@ -158,7 +161,7 @@ def _cut_shots(inp: TimelineBuildInput) -> list[align.CutShot]:
             visual_prompt=s.visualPrompt,
             need_kind=s.needKind,
             clip_keys=tuple(s.clipKeys),
-            camera_motion=bool(s.cameraMotion),
+            motion=s.motion,  # ADR-076：运镜方案原样进收口（并镜取主导、拆镜共用）
             transition_after=(s.transitionAfter or None),
         )
         for s in inp.shots
@@ -282,7 +285,6 @@ def timeline_build(inp: TimelineBuildInput) -> SkillOutput[TimelineBuildData]:
             atMs=span.atMs,
             durationMs=span.durationMs,
             sourceKey=source_key,
-            effect=(EFFECT_KENBURNS if shot.camera_motion else None),
             transition=transition,
         ))
         edl_shots.append(common.DspEdlShot(
@@ -293,6 +295,7 @@ def timeline_build(inp: TimelineBuildInput) -> SkillOutput[TimelineBuildData]:
             copy=shot.copy,
             visualPrompt=shot.visual_prompt,
             needKind=shot.need_kind,
+            motion=shot.motion,  # ADR-076：I2V 从这里读运镜（不回查 inp.shots——并/拆会重排 id）
         ))
 
     if forced_hard_cut:

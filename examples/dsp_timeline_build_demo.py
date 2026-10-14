@@ -59,7 +59,10 @@ def _shots() -> list[dict]:
     # 旧 spec 快照里若还带 weight，pydantic 会忽略（extra 默认 ignore），故旧快照仍可跑。
     return [
         {"id": "s1", "label": "门头开场", "needKind": "门头", "durationMs": 3000,
-         "copy": "开门的瞬间", "clipKeys": ["dsp/scratch/t1/门店/门头1.jpg"], "cameraMotion": True},
+         "copy": "开门的瞬间", "clipKeys": ["dsp/scratch/t1/门店/门头1.jpg"],
+         "motion": {"type": "push_in", "intensity": "subtle", "direction": "toward_subject",
+                    "target": "店门", "reason": "门头留白充足，轻微推近强化第一眼",
+                    "positive": "", "negative": ""}},
         {"id": "s2", "label": "产品特写", "needKind": "产品", "durationMs": 4000,
          "copy": "保温12小时"},
         {"id": "s3", "label": "人物", "needKind": "人物", "durationMs": 2000,
@@ -107,7 +110,8 @@ def _dump(d) -> None:
     print(f"  totalMs   : {d.edl.totalMs}")
     for seg, shot in zip(d.edl.tracks[0].segments, d.edl.shots, strict=True):
         print(f"    • {shot.id}: {seg.atMs}–{seg.atMs + seg.durationMs}ms "
-              f"src={seg.sourceKey or '(空位)'} effect={seg.effect} transition={seg.transition}")
+              f"src={seg.sourceKey or '(空位)'} "
+              f"motion={(shot.motion.type if shot.motion else '固定机位')} transition={seg.transition}")
     for note in d.notes:
         print(f"  note      : {note}")
 
@@ -134,7 +138,11 @@ def main() -> None:
     check((segs[0].atMs, segs[0].durationMs) == (0, 2000), "s1 = 0–2000ms")
     check((segs[1].atMs, segs[1].durationMs) == (2000, 3200), "s2 = 2000–5200ms（含 400ms 停顿）")
     check((segs[2].atMs, segs[2].durationMs) == (5200, 3800), "s3 = 5200–9000ms（含 700ms 尾部静默）")
-    check(segs[0].effect == "kenburns", "第一镜开了运镜 → effect=kenburns")
+    check(not hasattr(segs[0], "effect"), "EDL segment 不再有 effect 字段（ADR-076 已退役）")
+    check(d.edl.shots[0].motion is not None and d.edl.shots[0].motion.type == "push_in",
+          "第一镜的运镜方案原样落进 edl.shots[].motion")
+    check(d.edl.shots[1].motion is None and d.edl.shots[2].motion is None,
+          "未给方案的镜头 motion 为 None（= 摄影机固定）")
     check(segs[2].sourceKey == "", "第三镜无匹配图 → 留空位")
     check(any("留空位" in n for n in d.notes), "留空位须在 notes 里如实说明")
     check(not any("推断" in n or "静默常量" in n for n in d.notes), "逐句都对上 → 不应有推断/静默告警")

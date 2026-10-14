@@ -7,16 +7,17 @@
 2. happy path：EDL → track[][] → 提交渲染 → **成片转存**为不可变 key（§7.3②）
 3. error：缺渲染密钥 → 明确报错（abort 步，不伪造成片）
 4. error：EDL 各镜均无图 → 轨道为空，如实报错
-5. 运镜（§7.5 第 2 步）：有片段 → 主轨出 video 元素 + apply-camera-motion；
-   无片段但标了运镜 → 如实告警（运镜需先有视频底）
+5. **运镜不在这里施加**（ADR-076）：运镜已随 I2V 生成落地，本步**不得**再施加（否则同一运动两次）
+   ——含一条**结构性哨兵**：``_dsp_mediakit`` 不再暴露 ``apply_camera_motion``
 
-mock 方式：替换 ``_dsp_mediakit.render`` / ``apply_camera_motion``（模块级薄适配层）
+mock 方式：替换 ``_dsp_mediakit.render``（模块级薄适配层）
 与 ``_dsp_storage`` 的 presign/fetch/put_file，不需要网络 / MediaKit 密钥 / 对象存储。
 密钥用假值经 env 注入。
 """
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import flowmind.skills  # noqa: F401  触发 @skill 注册
@@ -27,8 +28,7 @@ from flowmind.skills import _dsp_storage as storage
 
 _KEY_ENV = "DSP_MEDIAKIT_API_KEY"
 _BODY: dict = {}
-_MOTION: dict = {}       # 运镜调用留存（render 的 _BODY.clear() 不波及）
-_PUTS: list[str] = []    # 所有 put_file 的 key 序列（区分「运镜产物」与「成片」）
+_PUTS: list[str] = []    # 所有 put_file 的 key 序列（运镜退役后只有成片）
 
 
 def section(title: str) -> None:
@@ -59,15 +59,7 @@ def _install_fakes() -> None:
     def presign_get(key: str, ttl_s: int | None = None) -> str:
         return f"https://assets.example/{key}"
 
-    def apply_camera_motion(cfg, *, video_url: str, motion_style: str,
-                            start_s: float | None = None, end_s: float | None = None) -> dict:
-        _MOTION.update(video_url=video_url, motion_style=motion_style)
-        return {"task_id": "motion-task-1",
-                "video_url": "https://mediakit.example/tmp/motion.mp4?sig=y",
-                "duration": 3.0, "resolution": "1080p"}
-
     mediakit.render = render
-    mediakit.apply_camera_motion = apply_camera_motion
     storage.fetch_to_file = fetch_to_file
     storage.put_file = put_file
     storage.presign_get = presign_get
@@ -89,20 +81,21 @@ def _edl() -> dict:
 
 
 def _edl_motion() -> dict:
-    """带运镜的 EDL：2 镜，s1 标了 kenburns（应出 video + 运镜），s2 未标。"""
+    """带**运镜方案**的 EDL：2 镜，s1 带 push_in 方案（render **不应**因此做任何事），s2 无方案。"""
     return {"timeline": {"edl": {
         "version": 1, "totalMs": 7000,
         "tracks": [
             {"kind": "image", "segments": [
-                {"atMs": 0, "durationMs": 3000, "sourceKey": "dsp/scratch/t1/门店/门头1.jpg",
-                 "effect": "kenburns"},
+                {"atMs": 0, "durationMs": 3000, "sourceKey": "dsp/scratch/t1/门店/门头1.jpg"},
                 {"atMs": 3000, "durationMs": 4000, "sourceKey": "dsp/scratch/t1/产品/杯1.jpg"},
             ]},
             {"kind": "vo", "segments": [{"atMs": 0, "durationMs": 7000, "sourceKey": ""}]},
         ],
         "shots": [
             {"id": "s1", "atMs": 0, "durationMs": 3000,
-             "imageSourceKey": "dsp/scratch/t1/门店/门头1.jpg"},
+             "imageSourceKey": "dsp/scratch/t1/门店/门头1.jpg",
+             "motion": {"type": "push_in", "intensity": "subtle", "reason": "留白充足",
+                        "positive": "", "negative": ""}},
             {"id": "s2", "atMs": 3000, "durationMs": 4000,
              "imageSourceKey": "dsp/scratch/t1/产品/杯1.jpg"},
         ],
@@ -169,10 +162,9 @@ def main() -> None:
     print(f"  error.msg : {(r.error.message if r.error else '')[:60]}")
     check(r.ok is False and "轨道为空" in (r.error.message if r.error else ""), "空轨道须如实报错")
 
-    section("4a) 运镜（§7.5 第 2 步）：有片段 → video 元素 + apply-camera-motion")
+    section("4a) 有片段的镜头走 video 元素，无片段的回落 image（运镜**不在此施加**）")
     _BODY.clear()
     _PUTS.clear()
-    _MOTION.clear()
     r = invoke("render_compose", _ctx(deps=_edl_motion() | {
         "video": {"clips": [{"shotId": "s1", "key": "dsp/scratch/t1/run-demo-7/clips/s1.mp4",
                              "atMs": 0, "durationMs": 3000}]},
@@ -181,22 +173,24 @@ def main() -> None:
     check(r.ok, "有片段应渲染成功")
     kinds = [e["type"] for e in _BODY["track"][0]]
     print(f"  主轨元素  : {kinds}（s1 有片段=video / s2 无片段=image 回落）")
-    print(f"  运镜调用  : motion_style={_MOTION.get('motion_style')}")
-    print(f"  put_file  : {_PUTS}（先运镜产物，后成片）")
+    print(f"  put_file  : {_PUTS}（运镜退役 ⇒ 只有成片，没有 motion/*.mp4）")
     print(f"  warnings  : {r.data.warnings}")
     check(kinds == ["video", "image"], "有片段的镜头走 video 元素，无片段的回落 image")
-    check(_MOTION.get("motion_style") == "pan-zoom", "kenburns → MediaKit pan-zoom")
-    check("dsp/scratch/t1/run-demo-7/motion/s1.mp4" in _PUTS,
-          "运镜产物须转存为不可变 key（24h 签名 URL 不得当 key）")
-    check(any("已加运镜" in w for w in r.data.warnings), "运镜落地须如实报出")
+    check(_PUTS == ["dsp/output/t1/run-demo-7/final.mp4"], "只转存成片——不再有运镜产物")
+    check(not any("运镜" in w for w in r.data.warnings), "不再因运镜产生告警（本步已不参与运镜）")
 
-    section("4b) 无片段但标了运镜 → 如实告警（运镜需先有视频底）")
+    section("4b) 结构性哨兵：运镜施加路径**整块退役**（防重复施加）")
+    # 用 importlib 取模块：main() 后面还有一处**局部** import 同名（转场表那节），
+    # 直接用模块级 `mediakit` 会被 Python 当成局部变量而在此处未绑定。
+    _mk = importlib.import_module("flowmind.skills._dsp_mediakit")
+    check(not hasattr(_mk, "apply_camera_motion"),
+          "MediaKit 客户端不再暴露 apply_camera_motion（ADR-076）")
+    check(not hasattr(_mk, "motion_style_for") and not hasattr(_mk, "MOTION_STYLES"),
+          "旧运镜词表/映射一并退役（新适配表在 _dsp_video_gen.MOTION_ENGINE）")
     _BODY.clear()
     r = invoke("render_compose", _ctx(deps=_edl_motion()))
-    check(r.ok, "无片段仍可出静图成片")
-    print(f"  warnings  : {r.data.warnings}")
+    check(r.ok, "带运镜方案的 EDL 仍可静图成片")
     check([e["type"] for e in _BODY["track"][0]] == ["image", "image"], "无片段全部回落静图")
-    check(any("没有视频片段" in w for w in r.data.warnings), "运镜无视频底须如实告警")
 
     section("4c) 配音实测总长 ≠ 锁定时间线 → 自检告警（ADR-069 新不变量）")
     _BODY.clear()
