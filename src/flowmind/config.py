@@ -500,7 +500,7 @@ class DspConfig(BaseModel):
     # 图生视频模型按「建议时长附近」出片，与 timeline 锁定的镜头窗口**不是同一个数**：多出来的会顶到
     # 下一镜（画面多停一截）、不足的会让该镜提前卡住。故在转存前用 ffmpeg 把每镜裁到窗口。
     # 关掉 ⇒ 片段原样入库（``trim`` 实况按 0 上报，前端剪辑记录如实标「未裁切」）。
-    # 裁切失败（本机无 ffmpeg / 编码器缺失）**回落原片段 + 如实告警**，不丢镜。
+    # 裁切失败（ffmpeg 缺失 / 编码器缺失）**回落原片段 + 如实告警**，不丢镜。
     videogen_trim_window: bool = Field(default=True, validate_default=True)
     # ── 不足时**末帧定格**补齐（ADR-080；env FLOWMIND_DSP_VIDEOGEN_FREEZE_PAD=0 关）──
     # 源片段比窗口短 ⇒ ``tpad=stop_mode=clone`` 把末帧拖满窗口（画面在结尾静止一拍）。

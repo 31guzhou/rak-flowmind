@@ -19,7 +19,9 @@
 12. **质检的测量侧（ADR-079）**：有界重试 / 按镜复用 / qc 开=抽帧+客观量、关=不抽不测 / 抽帧失败不丢镜
 13. **裁到镜头窗口（ADR-080 阶段 5）**：超长裁掉 / 不足**末帧定格**补齐并如实报 `shortfallMs` /
     两个 env 开关（`TRIM_WINDOW` / `FREEZE_PAD`）/ 裁切失败**回落原片段**不丢镜
-    —— 本机**无 ffmpeg**，故裁切靠**注入假 ffmpeg/ffprobe** 离线真跑（断言命令行与 trim 统计）
+    —— 本 demo 要**离线可跑**（CI 无 ffmpeg），故裁切靠**注入假 ffmpeg/ffprobe** 断言命令行与 trim
+    统计；**真 ffmpeg 的行为复核另见 `examples/dsp_trim_realcheck.py`**（合成片段验 `-t` 真裁 / `tpad`
+    真补 / `-an` 真丢音轨，并用 ffprobe 复核输出时长）
 
 mock 方式：替换 ``_dsp_video_gen`` 的 submit/wait（模块级薄适配层）与 ``_dsp_storage``
 的 presign/fetch/put_file，不需要网络 / 厂商密钥 / 对象存储。密钥用假值经 env 注入。
@@ -114,9 +116,10 @@ def _install_fakes() -> None:
     def exists(key: str) -> bool:
         return key in _EXISTS
 
-    # ── 假 ffmpeg / ffprobe（ADR-080）：本机没有 ffmpeg，故裁切路径靠**注入假件**验证 ──
+    # ── 假 ffmpeg / ffprobe（ADR-080）：本 demo 要离线可跑（CI 无 ffmpeg），故裁切路径靠**注入假件** ──
     # ffprobe 按**文件名**报源片段时长（`_SOURCE_MS`），ffmpeg 只记录命令行并落一个占位文件。
-    # 于是「超长裁掉 / 不足末帧定格」两条路径**在本机离线真跑**，命令行与 trim 统计都被断言。
+    # 于是「超长裁掉 / 不足末帧定格」两条路径**在无 ffmpeg 的机器上也跑得通**，命令行与 trim 统计都被断言；
+    # **真 ffmpeg 下的实际行为**由 `examples/dsp_trim_realcheck.py` 复核（本机有 ffmpeg 时按需真跑）。
     def run_ffprobe(cmd: list[str], **kw) -> tuple[int, str, str]:
         ms = _SOURCE_MS.get(Path(cmd[-1]).name, 3000)
         out = json.dumps({"format": {"duration": f"{ms / 1000:.3f}"},
@@ -518,7 +521,7 @@ def main() -> None:
     check(any("未做定格补齐" in w for w in r.data.warnings), "未补须**如实列出**（不静默）")
     os.environ.pop("FLOWMIND_DSP_VIDEOGEN_FREEZE_PAD")
 
-    # 13d) 裁切失败（本机无 ffmpeg）⇒ **回落原片段** + 如实告警（画质/节奏风险 ≠ 丢镜）
+    # 13d) 裁切失败（ffmpeg 缺失）⇒ **回落原片段** + 如实告警（画质/节奏风险 ≠ 丢镜）
     _reset()
 
     def _no_ffmpeg(cmd, **kw):

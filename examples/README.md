@@ -30,6 +30,24 @@ PYTHONPATH=$PWD/src conda run -n flowmind python examples/<name>_demo.py
 | [`dsp_cart_sticker_demo.py`](./dsp_cart_sticker_demo.py) | dsp 小黄车贴片 | 仅带货形态、商品锚点手工档、纯内容形态/缺锚点/越界各自如实降级 |
 | [`dsp_render_compose_demo.py`](./dsp_render_compose_demo.py) | dsp 合成渲染（MediaKit） | EDL→`track[][]`、封面走 `output.cover` 抽帧、**24h 签名 URL 转存**为不可变 key、缺密钥/空轨道报错 |
 
+## 真 ffmpeg 复核（按需，不进回归底线）
+
+[`dsp_trim_realcheck.py`](./dsp_trim_realcheck.py) 与上面 18 个 demo **分工相反**：demo 一律
+**离线自包含**（mock 掉全部外部依赖，故 CI 里任何机器都绿），而它**要求真 ffmpeg**——用合成片段
+把 dsp 里**依赖 ffmpeg 的原语**真跑一遍，并用 ffprobe 复核输出：
+
+```bash
+PYTHONPATH=$PWD/src python examples/dsp_trim_realcheck.py
+# ffmpeg 没进全局 PATH 时，把 bin 目录当第一个参数传入：
+PYTHONPATH=$PWD/src python examples/dsp_trim_realcheck.py /path/to/ffmpeg/bin
+```
+
+覆盖 `_media.clip_to_window`（超长真裁 / 不足真 `tpad` 定格补齐 / 等长与关闭补齐的原样返回 /
+坏文件抛 `MediaError`）与 `_dsp_qc.sample_frames`（10%/50%/90% 三帧真抽出 PNG、时长未知只抽首帧、
+坏文件抛错），共 **28 条断言**。**本机无 ffmpeg 即自行跳过（exit 0）**——故**不**进
+「一键全跑 demo」回归底线；它是**按需**复核，把「裁切/抽帧机制是否真按设计工作」从口头断言
+变成可复跑的产物。
+
 ## 🚀 Agent 开箱即用：`discover()`
 
 每个 demo 第一步都跑 `discover()` / `field_names()`，让 Agent 自动发现技能
