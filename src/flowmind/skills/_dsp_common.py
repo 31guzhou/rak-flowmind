@@ -118,15 +118,23 @@ class DspShotMotion(BaseModel):
 class DspSwitches(BaseModel):
     """本单的**开关整组**（ADR-076 起随公共 args 下发，不再只靠「哪些节点在场」表达）。
 
-    为什么要有它：`motion` **不 gate 任何节点**（运镜是逐镜参数不是工序），后端无从「数节点」得知
-    运镜开没开——而 `image_to_video` 必须知道（关 ⇒ 逐镜下**固定机位**条款；开 ⇒ 下发逐镜方案）。
-    缺省按各开关的缺省给（tts/bgm/video 开、motion 关）。
+    为什么要有它：`motion` / `qc` **都不 gate 任何节点**（前者是逐镜参数、后者是出片后的质检），
+    后端无从「数节点」得知它们开没开——而 `image_to_video` 必须知道：
+    `motion` 决定「关 ⇒ 逐镜下固定机位条款」还是「开 ⇒ 下发逐镜方案」；
+    `qc`（ADR-079）决定「出片后要不要**抽帧 + 客观量**」（免费但耗 ffmpeg，且帧要上传），
+    判定与重试调度在**前端质检层**（本侧只产**测量与帧**，不判定）。
+    缺省按各开关的缺省给（tts/bgm/video 开、motion/qc 关）。
     """
 
     tts: bool = True
     bgm: bool = True
     video: bool = True
     motion: bool = False
+    qc: bool = Field(
+        default=False,
+        description="质检（ADR-079）：出片后逐镜**抽帧 + 客观量**（时长/分辨率/亮度/冻结帧），"
+                    "帧上传到 `{cachePrefix}/{runId}/qa/`。**判定与重试调度在前端质检层**——"
+                    "本侧只测量，不判「能不能用」（故它也不 gate 任何节点）")
 
 
 class DspShotIntent(BaseModel):

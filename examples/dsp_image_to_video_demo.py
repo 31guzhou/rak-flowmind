@@ -40,6 +40,9 @@ _PUTS: list[str] = []
 _SUBMITTED: list[dict] = []
 _FETCHED: list[str] = []
 _FAIL_SHOTS: set[str] = set()
+# ADR-079 用：提交时**前 N 次**抛「瞬时（retriable）」错（验有界重试）；以及「已存在的对象」（验按镜复用）。
+_TRANSIENT_FAILS = {"n": 0}
+_EXISTS: set[str] = set()
 
 # 素材池里这些图的**实际像素**（按文件名匹配）：补生图 = 9:16 @2K（超 I2V 输出 720×1280），
 # 另一张 = 小图（未超 ⇒ 原图直用，不落派生件）。
@@ -70,6 +73,10 @@ def _install_fakes() -> None:
         _SUBMITTED.append({"prompt": prompt, "image_url": image_url, "seconds": seconds,
                            "tail_image_url": tail_image_url,
                            "motion_params": dict(motion_params or {})})
+        # **有界重试**（ADR-079）：前 N 次抛瞬时错（厂商把错误分成 retriable/其它，本步只重试前者）
+        if _TRANSIENT_FAILS["n"] > 0:
+            _TRANSIENT_FAILS["n"] -= 1
+            raise videogen.DspVideoGenError("网关抖动（瞬时）", category="transient", retriable=True)
         return f"task_{len(_SUBMITTED)}"
 
     def wait(cfg, task_id: str, *, api_key: str = "") -> dict:
@@ -93,11 +100,15 @@ def _install_fakes() -> None:
     def presign_get(key: str, ttl_s: int | None = None) -> str:
         return f"https://assets.example/{key}"
 
+    def exists(key: str) -> bool:
+        return key in _EXISTS
+
     videogen.submit = submit
     videogen.wait = wait
     storage.fetch_to_file = fetch_to_file
     storage.put_file = put_file
     storage.presign_get = presign_get
+    storage.exists = exists
 
 
 def _edl() -> dict:
@@ -141,6 +152,8 @@ def _reset() -> None:
     _SUBMITTED.clear()
     _FETCHED.clear()
     _FAIL_SHOTS.clear()
+    _EXISTS.clear()
+    _TRANSIENT_FAILS["n"] = 0
 
 
 def main() -> None:
@@ -349,6 +362,75 @@ def main() -> None:
           "本引擎无运动入参 ⇒ motion_params 恒空（参数位留给将来引擎）")
     check(videogen.motion_expression(None)[0] == videogen.MOTION_STATIC_CLAUSE,
           "未给方案（None）也走固定机位条款——「不运镜」要明确告诉模型别动镜头")
+
+
+
+    section("12) ADR-079：有界重试 / 按镜复用 / 质检的测量侧（抽帧 + 客观量）")
+    from flowmind.skills import _dsp_common as _common12
+    from flowmind.skills import _dsp_qc as qc
+
+    # 12a) **有界重试**：第一次提交抛瞬时错（retriable）⇒ 重试后成功，该镜**不**回落静图
+    _reset()
+    _TRANSIENT_FAILS["n"] = 1
+    r = invoke("image_to_video", _ctx())
+    check(r.ok and len(r.data.clips) >= 1, "瞬时错重试后仍出片（不因一次抖动丢镜）")
+    check(any("重试" in w for w in r.data.warnings), "重试须如实告警（不静默吞掉）")
+
+    # 12b) **按镜复用**：regenerateShotIds 只列 s1 ⇒ s2 复用已有产物（不重新出片、不重复计费）
+    _reset()
+    s2_key = _common12.step_key("dsp/scratch/t1", "run-demo-8", "clips", "s2.mp4")
+    _EXISTS.add(s2_key)
+    r = invoke("image_to_video", _ctx(regenerateShotIds=["s1"]))
+    keys = [c.key for c in r.data.clips]
+    check(s2_key in keys, "未列入 regenerateShotIds 且已有产物 ⇒ 直接复用该 key")
+    check(len(_SUBMITTED) == 1, "只重生成被点名的那一镜（实际提交 %d 次）" % len(_SUBMITTED))
+    check(any("复用" in w for w in r.data.warnings), "复用须如实说明（未重复出片 / 未重复计费）")
+
+    # 12c) **质检测量侧**：qc 开关开 ⇒ 抽帧上传 + 客观量随片段带出；关 ⇒ 完全不抽不测
+    _reset()
+    calls = {"n": 0}
+    def _fake_sample(video_path, out_dir, duration_s, ratios=None):
+        calls["n"] += 1
+        paths = []
+        for i in range(3):
+            fp = out_dir + "/f" + str(i) + ".png"
+            Path(fp).write_bytes(b"png")
+            paths.append(fp)
+        return qc.FrameSample(paths=paths, ratios=list(ratios or qc.FRAME_RATIOS))
+    def _fake_stats(paths):
+        return {"width": 720, "height": 1280, "frames": len(paths),
+                "meanLuma": [40.0, 42.0, 41.0], "meanDiff": [12.0, 11.0],
+                "blackFrames": 0, "frozenPairs": 0}
+    real_sample, real_stats = qc.sample_frames, qc.frame_stats
+    qc.sample_frames, qc.frame_stats = _fake_sample, _fake_stats
+    try:
+        r = invoke("image_to_video", _ctx(switches={"qc": True}))
+        c0 = r.data.clips[0]
+        check(len(c0.frames) == 3 and all("/qa/" in k for k in c0.frames),
+              "qc 开 ⇒ 逐镜抽 3 帧并上传到 qa/（帧 key 随片段带出）")
+        check(all(k.endswith(".png") for k in c0.frames), "帧以 PNG 上传（与抽帧格式一致，不谎报类型）")
+        check(c0.frameStats.get("frozenPairs") == 0 and c0.frameStats.get("width") == 720,
+              "客观量随片段带出（分辨率 / 亮度 / 差异 / 黑帧与冻结帧计数）")
+        check(calls["n"] == len(r.data.clips), "每镜各抽一次（不重复抽）")
+
+        _reset(); calls["n"] = 0
+        r = invoke("image_to_video", _ctx(switches={"qc": False}))
+        check(calls["n"] == 0 and all(not c.frames for c in r.data.clips),
+              "qc 关 ⇒ 不抽帧不测（不产生额外开销）")
+        check(all(c.frameStats == {} for c in r.data.clips), "qc 关 ⇒ 不带客观量（不留空壳）")
+
+        # 12d) **抽帧失败不丢镜**：测量挂了仍保住片段并如实告警（画质风险 != 丢镜）
+        _reset()
+        def _boom(video_path, out_dir, duration_s, ratios=None):
+            raise media.MediaError("本机没有 ffmpeg（演示注入）")
+        qc.sample_frames = _boom
+        r = invoke("image_to_video", _ctx(switches={"qc": True}))
+        check(len(r.data.clips) >= 1 and all(not c.frames for c in r.data.clips),
+              "抽帧失败 ⇒ 片段仍保住（该镜不丢）")
+        check(any("抽帧/测量失败" in w for w in r.data.warnings),
+              "抽帧失败须如实告警（不伪造帧 / 不伪造统计）")
+    finally:
+        qc.sample_frames, qc.frame_stats = real_sample, real_stats
 
 
     print("\n✅ dsp_image_to_video_demo 全部通过")

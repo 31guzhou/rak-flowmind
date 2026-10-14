@@ -32,7 +32,7 @@ from __future__ import annotations
 import hashlib
 import tempfile
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -40,6 +40,7 @@ from flowmind.config import DspConfig, load_config
 from flowmind.contracts import SkillOutput
 from flowmind.skill import skill
 from flowmind.skills import _dsp_common as common
+from flowmind.skills import _dsp_qc as qc
 from flowmind.skills import _dsp_storage as storage
 from flowmind.skills import _dsp_video_gen as videogen
 from flowmind.skills import _media as media
@@ -56,6 +57,11 @@ _PROMPT_NEGATIVE = "。画面中不要出现任何文字、字幕、水印、log
 _I2V_INPUT_DIR = "i2v_input"
 _IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
+# 提交的**有界重试**次数（ADR-079）：只对厂商标 `retriable` 的瞬时错误重试，最多这么多次。
+# 为什么是 2：一次重试足以越过常见的瞬时抖动，又不至于把「配额已尽」这类问题拖成长时间等待
+# （后者分类为 environment、`retriable=False`，**根本不会**进重试）。
+_SUBMIT_ATTEMPTS = 2
+
 
 class ImageToVideoInput(DspBaseInput):
     """图生视频入参（公共上下文已含 ``shots[]``——逐镜的**画面提示词**取自其 ``visualPrompt``，
@@ -64,14 +70,26 @@ class ImageToVideoInput(DspBaseInput):
     maxShots: int = Field(
         default=0, ge=0,
         description="最多生成几镜（0 = 不限）；图生视频按镜计费，用于控成本")
+    regenerateShotIds: list[str] = Field(
+        default_factory=list,
+        description="**只重生成这些镜**（ADR-079 的按镜重试 / 换图重生成）：未列出的镜头若在确定性 key "
+                    "上已有产物则**复用**（不重复出片、不重复计费）；**留空 = 全部重新生成**（正常首跑）")
 
 
 class ShotClip(BaseModel):
-    """单镜视频片段（供 render 侧作 ``video`` 元素）。"""
+    """单镜视频片段（供 render 侧作 ``video`` 元素）+ **质检的测量产物**（ADR-079）。"""
     shotId: str
     key: str = Field(..., description="片段的云存储 key")
     atMs: int
     durationMs: int
+    frames: list[str] = Field(
+        default_factory=list,
+        description="抽帧 key（ADR-079；qc 开关关 / 抽帧失败时为空——**不伪造帧**）。"
+                    "前端质检层读这些帧做视觉判定（画面 / 主体一致性 / 运动质量 / 镜头意图）")
+    frameStats: dict[str, Any] = Field(
+        default_factory=dict,
+        description="**客观量**（PIL 本地算，无需 numpy）：分辨率 / 逐帧平均亮度 / 相邻帧差异 / "
+                    "黑帧与疑似冻结帧计数。**是测量不是判决**（阈值见 `_dsp_qc`）")
 
 
 class ImageToVideoData(BaseModel):
@@ -268,6 +286,32 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                                     risk_note="各镜缺图或缺文案；请补齐素材/文案后重跑。")],
             confidence=0.0, degraded=True, degradation_reason="no-generatable-shots")
 
+    # ── 按镜重生成（ADR-079）：`regenerateShotIds` 之外的镜头，若确定性 key 上已有产物就**复用** ──
+    # 用法：前端质检/调度层发现某镜没过，换图后只把该镜交给本步重跑；其余镜的产物原样带出，
+    # **不重复出片、不重复计费**。`regenerateShotIds` 为空 = 正常首跑（全部生成）。
+    regen = set(inp.regenerateShotIds)
+    reused_clips: list[ShotClip] = []
+    if regen:
+        to_generate: list[_Job] = []
+        for job in jobs:
+            key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
+            if job.shot_id not in regen and storage.exists(key):
+                reused_clips.append(ShotClip(
+                    shotId=job.shot_id, key=key, atMs=job.at_ms, durationMs=job.duration_ms))
+            else:
+                to_generate.append(job)
+        if reused_clips:
+            warnings.append(
+                f"按镜重生成：{len(reused_clips)} 镜**复用**已有片段（未重新出片、未重复计费）；"
+                f"本次只生成 {len(to_generate)} 镜")
+        jobs = to_generate
+    if not jobs and not reused_clips:
+        return SkillOutput(
+            data=ImageToVideoData(warnings=warnings),
+            reasoning=[common.chain("没有可生成的镜头（缺图 / 缺文案）",
+                                    risk_note="各镜缺图或缺文案；请补齐素材/文案后重跑。")],
+            confidence=0.0, degraded=True, degradation_reason="no-generatable-shots")
+
     # ── 先全部提交（厂商侧并行跑），再逐个等 ──
     # 素材图在这时才逐张准备（降采样要下载+缩放+转存，只对**真要生成的镜**做）。
     url_cache: dict[str, str] = {}
@@ -279,19 +323,37 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             continue
         tail_url = (_i2v_image_url(inp, cfg, job.tail_key, cap, url_cache, warnings, stats)
                     if job.tail_key else "")
-        try:
-            task_id = videogen.submit(
-                cfg, prompt=job.prompt, image_url=image_url,
-                seconds=job.seconds, tail_image_url=tail_url,
-                motion_params=job.motion_params)
-        except videogen.DspVideoGenError as exc:
-            warnings.append(f"镜头 {job.shot_id} 提交失败（{exc.category}）：{exc}——该镜回落静图")
+        # **有界重试**（ADR-079）：厂商把错误分成了 transient/其它（`DspVideoGenError.retriable`），
+        # 而此前这个标志**被丢掉了**——瞬时抖动也直接判该镜回落静图，白白浪费一镜的配额。
+        # 只对 `retriable` 重试，最多 `_SUBMIT_ATTEMPTS` 次；其余错误立刻如实报出（不无脑重试）。
+        task_id = ""
+        last: videogen.DspVideoGenError | None = None
+        for attempt in range(1, _SUBMIT_ATTEMPTS + 1):
+            try:
+                task_id = videogen.submit(
+                    cfg, prompt=job.prompt, image_url=image_url,
+                    seconds=job.seconds, tail_image_url=tail_url,
+                    motion_params=job.motion_params)
+                break
+            except videogen.DspVideoGenError as exc:
+                last = exc
+                if not exc.retriable or attempt >= _SUBMIT_ATTEMPTS:
+                    break
+                warnings.append(
+                    f"镜头 {job.shot_id} 提交瞬时失败（第 {attempt} 次，{exc.category}）：{exc}——重试")
+        if not task_id:
+            exc = last
+            detail = f"（{exc.category}）：{exc}" if exc else "：未知原因"
+            warnings.append(f"镜头 {job.shot_id} 提交失败{detail}——该镜回落静图")
             continue
         submitted.append((job, task_id))
 
-    # ── 收片 → 转存（文档：直链临时保存 24h，绝不当 key）──
-    clips: list[ShotClip] = []
+    # ── 收片 → 转存（文档：直链临时保存 24h，绝不当 key）→ （qc 开时）抽帧 + 客观量 ──
+    clips: list[ShotClip] = list(reused_clips)
+    qc_measured = 0
     for job, task_id in submitted:
+        frames: list[str] = []
+        frame_stats: dict[str, Any] = {}
         try:
             raw = videogen.wait(cfg, task_id)
             url = videogen.result_url(raw)
@@ -299,11 +361,27 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             with tempfile.TemporaryDirectory(prefix="dsp-i2v-") as tmp:
                 local = storage.fetch_to_file(url, str(Path(tmp) / f"{job.shot_id}.mp4"))
                 storage.put_file(local, key, content_type="video/mp4")
+                # **质检的测量侧**（ADR-079）：qc 开关开时才抽帧 + 算客观量（ffmpeg 免费但耗时，帧要上传）。
+                # 判定与重试调度在**前端质检层**；本侧**只测量**。失败即**如实告警并放弃本次测量**——
+                # 抽帧失败仍要保住这一镜的片段（画质风险 ≠ 丢镜），**绝不伪造帧或统计**。
+                if inp.switches.qc:
+                    try:
+                        sample = qc.sample_frames(local, tmp, job.duration_ms / 1000.0)
+                        frame_stats = qc.frame_stats(sample.paths)
+                        for i, path in enumerate(sample.paths):
+                            fkey = common.step_key(
+                                inp.cachePrefix, inp.runId, "qa", f"{job.shot_id}-{i}.png")
+                            storage.put_file(path, fkey, content_type="image/png")
+                            frames.append(fkey)
+                        qc_measured += 1
+                    except media.MediaError as exc:
+                        warnings.append(
+                            f"镜头 {job.shot_id} 抽帧/测量失败（{exc}）——本次不做客观量（如实跳过）")
         except (videogen.DspVideoGenError, storage.DspStorageError) as exc:
             warnings.append(f"镜头 {job.shot_id} 出片/转存失败：{exc}——该镜回落静图")
             continue
         clips.append(ShotClip(shotId=job.shot_id, key=key, atMs=job.at_ms,
-                              durationMs=job.duration_ms))
+                              durationMs=job.duration_ms, frames=frames, frameStats=frame_stats))
 
     failed = len(jobs) - len(clips)
     if not clips:
@@ -319,11 +397,12 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         [f"输入降采样 {stats['downscaled']} 张"] if stats["downscaled"] else []) + (
         [f"运镜方案 {motion_planned} 镜"] if motion_planned else []) + (
         [f"固定机位 {no_motion} 镜"] if no_motion else []) + (
-        [f"{motion_ignored} 镜有运镜方案但「运镜」开关已关，未下发"] if motion_ignored else [])
+        [f"{motion_ignored} 镜有运镜方案但「运镜」开关已关，未下发"] if motion_ignored else []) + (
+        [f"质检测量 {qc_measured} 镜（抽帧 + 客观量；判定在前端质检层）"] if qc_measured else [])
     return SkillOutput(
         data=ImageToVideoData(clips=clips, warnings=warnings),
         reasoning=[common.chain(
-            f"图生视频完成：{len(clips)}/{len(jobs)} 镜出片（共 {total_ms}ms"
+            f"图生视频完成：{len(clips)}/{len(jobs) + len(reused_clips)} 镜出片（共 {total_ms}ms"
             f"{'；' + '，'.join(extras) if extras else ''}）",
             causal_analysis=(
                 f"逐镜把素材图（预签名 URL）+ **画面提示词**喂 {cfg.videogen_model}（prompt 末尾统一追加"

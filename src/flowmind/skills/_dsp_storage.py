@@ -184,6 +184,22 @@ def presign_get(key: str, ttl_s: int | None = None) -> str:
                               retriable=True) from exc
 
 
+def exists(key: str) -> bool:
+    """对象是否已存在（``head_object``）。
+
+    ADR-079 用它实现**按镜重生成**：`regenerateShotIds` 之外的镜头若已有确定性 key 的产物，
+    直接**复用**（不重复计价、不重复出片）。读不通 / 未配置 ⇒ 返回 ``False``（调用方据此照常生成，
+    不因探测失败而丢镜——**宁可多做一次，不可少出一镜**）。
+    """
+    if not key or not storage_configured():
+        return False
+    try:
+        _client().head_object(Bucket=_bucket(), Key=key)
+        return True
+    except Exception:  # noqa: BLE001  不存在 / 无权限 / 网络抖动：一律按「没有」处理
+        return False
+
+
 def fetch_to_file(url: str, dest_path: str, timeout_s: float | None = None) -> str:
     """把 URL 内容流式落本地文件（MediaKit 成片转存第一步）。
 
