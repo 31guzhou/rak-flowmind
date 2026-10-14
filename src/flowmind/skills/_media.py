@@ -4,23 +4,48 @@
 一切智能环节（ASR/TTS/翻译/OCR）走云 API——见 CLAUDE.md 云优先原则。
 命令通过 run_ffmpeg/run_ffprobe 间接执行，测试可注入 fake；
 图片的探尺寸 / 等比缩放走惰性 PIL（不经命令行，故无 fake 注入点）。
+
+**ffmpeg 从哪来**：默认按 ``PATH`` 找；本机 ffmpeg 常是「按需下载、不进全局 PATH」（ADR-080
+的已知实况），故支持配置 ``FLOWMIND_MEDIA_BIN_DIR``（通常写在 ``.env``）——配了就**优先**从该
+目录解析 ffmpeg/ffprobe 的**绝对路径**（不改系统 PATH，也不动父进程环境）。未配 ⇒ 原样按 PATH。
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from typing import NamedTuple
+
+# ffmpeg/ffprobe 所在的 bin 目录（env 键名；值形如 D:\App\ffmpeg\bin 或 /usr/local/bin）
+_BIN_DIR_ENV = "FLOWMIND_MEDIA_BIN_DIR"
 
 
 class MediaError(Exception):
     """ffmpeg 操作失败。"""
 
 
+def _resolve_cmd(cmd: list[str]) -> list[str]:
+    """把 ``cmd[0]``（ffmpeg/ffprobe）解析成**绝对路径**：配了 ``FLOWMIND_MEDIA_BIN_DIR`` 就优先用它。
+
+    为什么解析绝对路径而不是改 PATH：``subprocess`` 在 Windows 上走 ``CreateProcess``，「传 env」
+    时 PATH 搜索语义有歧义；直接给绝对路径最确定，也不污染父进程环境。找不到 ⇒ 原样返回，让
+    「本机没有 ffmpeg」那条路径照常如实报错（**不静默换工具**）。
+    """
+    from flowmind.config import ensure_env_loaded  # 惰性：该键通常写在 .env 里，此处不保证已载
+
+    ensure_env_loaded()
+    bin_dir = os.environ.get(_BIN_DIR_ENV, "").strip()
+    if not bin_dir or not cmd:
+        return cmd
+    found = shutil.which(cmd[0], path=bin_dir)
+    return [found, *cmd[1:]] if found else cmd
+
+
 def _run(cmd: list[str], timeout: float = 300.0) -> tuple[int, str, str]:
     # 显式 UTF-8 解码：父进程 locale 被翻成 C 时，跟随 locale 解码非 ASCII 输出会崩溃
     proc = subprocess.run(
-        cmd, capture_output=True, text=True,
+        _resolve_cmd(cmd), capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=timeout,
     )
     return proc.returncode, proc.stdout, proc.stderr

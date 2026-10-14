@@ -38,15 +38,16 @@ PYTHONPATH=$PWD/src conda run -n flowmind python examples/<name>_demo.py
 
 ```bash
 PYTHONPATH=$PWD/src python examples/dsp_trim_realcheck.py
-# ffmpeg 没进全局 PATH 时，把 bin 目录当第一个参数传入：
+# ffmpeg 没进全局 PATH 时，把 bin 目录当第一个参数传入（脚本会写进 FLOWMIND_MEDIA_BIN_DIR）：
 PYTHONPATH=$PWD/src python examples/dsp_trim_realcheck.py /path/to/ffmpeg/bin
 ```
 
-覆盖 `_media.clip_to_window`（超长真裁 / 不足真 `tpad` 定格补齐 / 等长与关闭补齐的原样返回 /
-坏文件抛 `MediaError`）与 `_dsp_qc.sample_frames`（10%/50%/90% 三帧真抽出 PNG、时长未知只抽首帧、
-坏文件抛错），共 **28 条断言**。**本机无 ffmpeg 即自行跳过（exit 0）**——故**不**进
-「一键全跑 demo」回归底线；它是**按需**复核，把「裁切/抽帧机制是否真按设计工作」从口头断言
-变成可复跑的产物。
+ffmpeg 的解析与生产**同一套**：`_media` 先看 `.env` 的 `FLOWMIND_MEDIA_BIN_DIR`（本机 ffmpeg 常是
+「按需下载、不进全局 PATH」），没有才按 `PATH`。覆盖 `_media.clip_to_window`（超长真裁 / 不足真
+`tpad` 定格补齐 / 等长与关闭补齐的原样返回 / 坏文件抛 `MediaError`）与 `_dsp_qc.sample_frames`
+（10%/50%/90% 三帧真抽出 PNG、时长未知只抽首帧、坏文件抛错），共 **28 条断言**。**两处都找不到
+ffmpeg 即自行跳过（exit 0）**——故**不**进「一键全跑 demo」回归底线；它是**按需**复核，把
+「裁切/抽帧机制是否真按设计工作」从口头断言变成可复跑的产物。
 
 ## 🚀 Agent 开箱即用：`discover()`
 

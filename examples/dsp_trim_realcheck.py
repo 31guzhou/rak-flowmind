@@ -5,12 +5,12 @@
 **注入假 ffmpeg/ffprobe** 逐字断言命令行；本脚本**恰好相反**——它**要求真 ffmpeg**，
 用合成片段验「命令真跑下去会得到什么」（`-t` 真裁、`tpad` 真补、`-an` 真丢音轨）。
 
-运行（ffmpeg 在 PATH 里即可；也可把 bin 目录当第一个参数传入）：
+运行（ffmpeg 从 ``FLOWMIND_MEDIA_BIN_DIR`` 或 ``PATH`` 解析——与生产同一套 `_media` 解析）：
 
     PYTHONPATH=$PWD/src python examples/dsp_trim_realcheck.py
     PYTHONPATH=$PWD/src python examples/dsp_trim_realcheck.py /path/to/ffmpeg/bin
 
-**无 ffmpeg 即自行跳过（exit 0）**——故不进「一键全跑 demo」回归底线（那条线要求
+**找不到 ffmpeg 即自行跳过（exit 0）**——故不进「一键全跑 demo」回归底线（那条线要求
 任何机器都绿），是**按需**复核。产物写系统临时目录，跑完自清。
 
 覆盖（源时长由 ffprobe 实测，断言走**关系**而非硬编码数字）：
@@ -25,8 +25,6 @@
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -34,11 +32,24 @@ from pathlib import Path
 from flowmind.skills import _dsp_qc as qc
 from flowmind.skills import _media as media
 
-if len(sys.argv) > 1:  # 允许显式给 ffmpeg bin 目录（本机常见：ffmpeg 未进全局 PATH）
-    os.environ["PATH"] = sys.argv[1] + os.pathsep + os.environ.get("PATH", "")
+# 允许显式给 ffmpeg bin 目录：写进 FLOWMIND_MEDIA_BIN_DIR，让脚本走**与生产同一套**解析
+# （`_media` 优先从该目录取绝对路径，不要求 ffmpeg 进系统 PATH）。
+if len(sys.argv) > 1:
+    os.environ["FLOWMIND_MEDIA_BIN_DIR"] = sys.argv[1]
 
-if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
-    print("跳过：本机 PATH 里没有 ffmpeg/ffprobe（本脚本按需复核，CI 不受影响）")
+
+def _ffmpeg_ready() -> bool:
+    """ffmpeg 是否可用（走 `_media` 的解析 ⇒ `.env` 里配的 bin 目录同样生效）。"""
+    try:
+        rc, _, _ = media.run_ffmpeg(["ffmpeg", "-version"])
+    except FileNotFoundError:
+        return False
+    return rc == 0
+
+
+if not _ffmpeg_ready():
+    print("跳过：找不到 ffmpeg/ffprobe（按需复核；可在 .env 配 FLOWMIND_MEDIA_BIN_DIR，"
+          "或把 bin 目录当第一个参数传入）")
     sys.exit(0)
 
 _OK = 0
@@ -57,12 +68,13 @@ def check(label: str, cond: bool, detail: str) -> None:
 
 def gen_clip(path: Path, seconds: float) -> Path:
     """合成一段纯色片段（真编码，故 ffprobe 能量出真时长）。"""
-    subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
-         "-i", f"color=c=red:s=320x240:d={seconds}",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)],
-        check=True,
-    )
+    rc, _, err = media.run_ffmpeg([
+        "ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+        "-i", f"color=c=red:s=320x240:d={seconds}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+    ])
+    if rc != 0:
+        raise RuntimeError(f"合成片段失败: {err[-200:]}")
     return path
 
 
