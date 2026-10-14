@@ -52,8 +52,8 @@ def _resolve_cover(inp: CoverPickInput, edl: common.DspEdl | None) -> tuple[str,
                 return shot.imageSourceKey, notes
         notes.append("锁定时间线里各镜均未选到图，封面回落到素材池首图/第一镜指名")
     for shot in inp.shots:
-        if shot.clipKeys:
-            return shot.clipKeys[0], notes
+        if shot.asset_key:  # ADR-077：指名图取 image.assetKey（旧 clipKeys 由 lifter 提升）
+            return shot.asset_key, notes
     if inp.materials:
         return inp.materials[0].key, notes
     return "", notes

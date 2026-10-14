@@ -24,6 +24,7 @@ import flowmind.skills  # noqa: F401  触发 @skill 注册
 from flowmind.discover import field_names
 from flowmind.skill import invoke
 from flowmind.skills import _dsp_storage as storage
+from flowmind.skills._dsp_common import DspShot
 
 _WRITTEN: dict[str, str] = {}
 
@@ -323,6 +324,36 @@ def main() -> None:
     print(f"  error.code : {r.error.code if r.error else None}")
     check(r.ok is False and r.error and r.error.code == "VALIDATION",
           "非法入参应被 schema 拦为 VALIDATION")
+
+    section("11) ADR-077 四块：旧扁平字段提升（老 run 的 spec 原样重跑仍能跑）")
+    lifted = DspShot(
+        id="s1", durationMs=3000, copy="开门",
+        clipKeys=["k1", "k2"], visualPrompt="门头晨光",
+        motion={"type": "push_in", "intensity": "subtle", "reason": "留白充足"},
+        transitionAfter="dissolve")
+    check(lifted.image is not None and lifted.asset_key == "k1", "旧 clipKeys → image.assetKey（取首位）")
+    check(lifted.image.auto is False and "旧快照" in lifted.image.note,
+          "来源不可考 ⇒ auto=false 且 note 如实记明")
+    check(lifted.image.candidates == ["k1", "k2"], "候选全留（质检换图要取次优）")
+    check(lifted.author_prompt == "门头晨光", "旧 visualPrompt → i2v.authorPrompt")
+    check(lifted.motion_plan is not None and lifted.motion_plan.type == "push_in",
+          "旧 motion → i2v.motion（并据在场置 motionEnabled）")
+    check(lifted.i2v is not None and lifted.i2v.attempts == 0,
+          "提升后 attempts=0 —— **不会被误判成已回落静图**")
+    check(lifted.edit is None, "旧快照**不**提升出 edit（转场请求 ≠ 剪辑实况）")
+    check(lifted.transitionAfter == "dissolve", "转场请求留在镜头上，与 edit.transition（实况）成对")
+
+    modern = DspShot(id="s2", durationMs=3000, copy="保温",
+                     image={"assetKey": "k9"}, i2v={"videoKey": "v1", "attempts": 1})
+    check(modern.asset_key == "k9" and modern.i2v.videoKey == "v1" and modern.i2v.attempts == 1,
+          "四块在场时 lifter 幂等（不改写）")
+
+    r2 = invoke("timeline_build", _ctx(shots=[
+        {"id": "s1", "durationMs": 3000, "copy": "开门", "image": {"assetKey": "k1"}},
+    ]))
+    check(r2.ok, "显式四块的入参应 ok")
+    check(r2.data.edl.shots[0].imageSourceKey == "k1",
+          "显式 image.assetKey 照常被 timeline 选图（与旧 clipKeys 口径等价）")
 
     print("\n✅ dsp_timeline_build_demo 全部通过")
 

@@ -195,7 +195,7 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     # `s1..sK`，终版镜头的文案与画面提示词已随镜落进 `edl.shots[]`——回查 inp.shots 会**错配**。
     # 兜底：EDL 无该字段（旧快照）时按 id 回查下发的 shots（尽力而为，不臆造）。
     copy_by_shot = {s.id: s.copy_text for s in inp.shots}
-    visual_by_shot = {s.id: s.visualPrompt for s in inp.shots}
+    visual_by_shot = {s.id: s.author_prompt for s in inp.shots}  # ADR-077：真源在 i2v.authorPrompt
 
     # 输入降采样上限 = I2V **输出**分辨率（ADR-074；形状不合法即跳过降采样并如实说明）。
     cap = (0, 0)

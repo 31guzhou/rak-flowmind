@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from flowmind.contracts import Evidence, ReasoningChain, RuleHit
 
@@ -129,8 +129,95 @@ class DspSwitches(BaseModel):
     motion: bool = False
 
 
+class DspShotIntent(BaseModel):
+    """① **镜头意图**（阶段 1，ADR-077）。选图 Agent 的输入——「这一段要让观众知道什么」。"""
+    purpose: str = Field(default="", description="镜头目的（不是文案本身）")
+    subject: str = ""
+    action: str = ""
+    constraints: list[str] = Field(default_factory=list, description="必须出现 / 不得出现")
+    targetMs: int = Field(default=0, ge=0, description="目标时长（ms），供选图与生成参考")
+    source: str = Field(default="", description="model = 模型产出 / human = 人工改过（重推**不得静默覆盖**）")
+    note: str = ""
+
+
+class DspImageSelection(BaseModel):
+    """② **选图记录**（阶段 2，ADR-077）。`assetKey` 空 = 该镜是缺口。"""
+    auto: bool = Field(default=False, description="是否由选图 Agent 自动选（false = 人工指定 / 旧快照提升）")
+    assetKey: str = Field(default="", description="最终选定的图片 key（空 = 缺口）")
+    reason: str = ""
+    duplicateRisk: str = Field(
+        default="none", description="none / recent（近期运行用过）/ near（与池内另一张近似重复）——如实标注")
+    visualQuality: int | None = None
+    generationPotential: int | None = Field(default=None, description="该图适不适合做图生视频（画像给，0-100）")
+    candidates: list[str] = Field(
+        default_factory=list, description="候选（含最终项、按优劣序）——质检失败要**换图**时取次优项")
+    locked: bool = Field(default=False, description="人工锁定：换图与重选**不得静默覆盖**")
+    note: str = ""
+
+
+class DspShotQa(BaseModel):
+    """质检结论（阶段 4，ADR-077）。三态：`pass` / `fail` / `unknown`——**unknown 绝不当作 pass**。"""
+    verdict: str = "unknown"
+    picture: str = "unknown"
+    subject: str = "unknown"
+    motion: str = "unknown"
+    intent: str = "unknown"
+    reason: str = ""
+    checkedAt: str = ""
+
+
+class DspI2vJob(BaseModel):
+    """③ **I2V 作业与质检**（阶段 3 / 4，ADR-077）。一次生成尝试的全部留档。"""
+    motionEnabled: bool = Field(default=False, description="本单「运镜」开关")
+    motion: DspShotMotion | None = None
+    authorPrompt: str = Field(default="", description="人工写的画面提示词（ADR-073；与 `copy` 分开）")
+    prompt: str = Field(default="", description="**实际下发**的最终提示词（含运镜并入的语言）")
+    promptSource: str = Field(default="", description="visualPrompt / copy / ''")
+    model: str = ""
+    params: dict[str, str] = Field(default_factory=dict)
+    attempts: int = Field(
+        default=0, ge=0,
+        description="已尝试次数（含重试）。**0 = 还没跑过**——据此区分「没跑」与「跑了没出片」")
+    taskIds: list[str] = Field(default_factory=list)
+    videoKey: str = Field(default="", description="生成产物 key（空 = 没出片）")
+    frames: list[str] = Field(default_factory=list, description="抽帧 key（阶段 4 质检用；空 = 没抽 / 抽帧失败）")
+    qa: DspShotQa | None = None
+
+
+class DspEditTrim(BaseModel):
+    """**裁切实况**（阶段 5，ADR-077）：源片段用了哪一段、裁掉多少、是否**不足**。"""
+    sourceMs: int = Field(default=0, ge=0)
+    outMs: int = Field(default=0, ge=0)
+    shortfallMs: int = Field(
+        default=0, ge=0, description=">0 = 源片段比镜头窗口短，已按末帧定格补齐（如实标注）")
+
+
+class DspEditSegment(BaseModel):
+    """④ **剪辑段**（阶段 5，ADR-077）。**在场 = 该镜已剪进成片**。"""
+    shotId: str = ""
+    atMs: int = Field(default=0, ge=0, description="该段在成片时间轴上的起点")
+    durationMs: int = Field(default=0, ge=0, description="该段的剪辑时长")
+    videoKey: str = Field(default="", description="最终使用的**视频** key（空 = 该段用静图）")
+    imageKey: str = Field(default="", description="回落的**静图** key")
+    voKey: str = ""
+    bgmKey: str = ""
+    transition: str | None = Field(default=None, description="**实际施加**的转场（null = 硬切；≠ 镜头上的请求）")
+    trim: DspEditTrim = Field(default_factory=DspEditTrim)
+    degradeMode: str = Field(default="", description="fallback_still / missing_clip / ''")
+    note: str = ""
+
+
 class DspShot(BaseModel):
-    """单个**镜头单元**（ADR-070：文案按视觉信息点切出来的一段）+ 逐句文案 + 需要的**图片**类目。"""
+    """单个**镜头单元**（ADR-070：文案按视觉信息点切出来的一段）+ **四块数据**（ADR-077）。
+
+    **四块**（ADR-077）：`intent`（选图输入）/ `image`（选图记录）/ `i2v`（运镜 + 生成 + 质检留档）/
+    `edit`（剪辑段）。此前这些信息挤在一个扁平对象里，于是「图选好了 / 片生成好了 / 剪进片子了」
+    三个**不同的成功条件**分不开——拆开后各自独立成败（前端状态机见 `lib/content/dsp-shot-state.ts`）。
+
+    **旧扁平字段（`visualPrompt` / `clipKeys` / `motion`）只进不出**：由 `_lift_legacy` 提升进四块，
+    保留它们只为让**旧 run 的 spec 原样重跑**与老客户端不改就能用。**新代码一律只读四块**
+    （用 `author_prompt` / `asset_key` / `motion_plan` 三个便捷属性）。
+    """
 
     # 线上字段名按契约 §2.2 是 ``copy``；但 ``copy`` 与 ``BaseModel.copy`` 撞名
     # （pydantic v2 会告警），故属性名用 ``copy_text`` + 别名 ``copy``（populate_by_name
@@ -139,26 +226,66 @@ class DspShot(BaseModel):
 
     id: str
     label: str = ""
-    needKind: str = Field(default="", description="该镜需要的图片类目（与 materials[].category 比对）")
+    needKind: str = Field(
+        default="", description="该镜需要的图片类目——**ADR-077 起退化为可选提示**（选图以画面为准）")
     durationMs: int = Field(
         ..., ge=1,
         description="镜头**估算**时长（ms，前端按文案字数算）——ADR-069：仅「无配音」时的兜底；"
                     "有配音时真实时长由 `timeline` 按逐句实测锁定，本值被覆盖")
     copy_text: str = Field(default="", alias="copy")
-    visualPrompt: str = Field(
-        default="",
-        description="该镜的**画面提示词**（ADR-073；与 `copy` 口播文案**分开**）——喂图生视频模型的"
-                    "**画面描述**（主体 + 动作 + 环境光线 + 景别机位 + 风格），**不是台词**。"
-                    "空串 = 未给 ⇒ 下游回落用 `copy` 出 prompt 并**如实告警**（绝不假装有画面提示词）")
-    clipKeys: list[str] = Field(default_factory=list, description="指名的图片 key（优先于 needKind 选图）")
-    motion: DspShotMotion | None = Field(
-        default=None,
-        description="该镜的**运镜方案**（ADR-076）。**缺省 = 摄影机固定**；`locked: true` = 人工锁定。"
-                    "由前端「运镜导演」**看图**产出（旧布尔 `cameraMotion` 已退役）")
     transitionAfter: str | None = Field(
         default=None,
-        description="该镜**末尾**的转场覆盖（ADR-070；符号名，如 `dissolve`）——缺省 = 硬切（不写字段）。"
-                    "只允许非交叠转场；厂商资源未登记时 render 侧如实回落硬切")
+        description="该镜**末尾**的转场**请求**（ADR-070；符号名，如 `dissolve`）——缺省 = 硬切。"
+                    "只允许非交叠转场；厂商资源未登记时 render 侧如实回落硬切。"
+                    "**它与 `edit.transition`（剪辑实况）成对**——别把请求当实况")
+
+    # ── 四块（ADR-077）──
+    intent: DspShotIntent | None = None
+    image: DspImageSelection | None = None
+    i2v: DspI2vJob | None = None
+    edit: DspEditSegment | None = None
+
+    # ── 旧扁平字段（只进不出；见类文档）──
+    visualPrompt: str = Field(default="", description="【已并入 i2v.authorPrompt】旧扁平字段，仅兼容")
+    clipKeys: list[str] = Field(
+        default_factory=list, description="【已并入 image.assetKey】旧扁平字段，仅兼容")
+    motion: DspShotMotion | None = Field(
+        default=None, description="【已并入 i2v.motion】旧扁平字段，仅兼容")
+
+    @model_validator(mode="after")
+    def _lift_legacy(self) -> "DspShot":
+        """旧扁平字段 → 四块（**幂等**：四块在场时不动）。"""
+        if self.i2v is None and (self.visualPrompt or self.motion is not None):
+            self.i2v = DspI2vJob(
+                motionEnabled=self.motion is not None,
+                motion=self.motion,
+                authorPrompt=self.visualPrompt,
+                promptSource="visualPrompt" if self.visualPrompt else "",
+            )
+        if self.image is None and self.clipKeys:
+            self.image = DspImageSelection(
+                auto=False,
+                assetKey=self.clipKeys[0],
+                candidates=list(self.clipKeys),
+                note="由旧快照的 clipKeys 提升（旧口径未记录是否自动选图）",
+            )
+        return self
+
+    # ── 便捷读（下游只读这三个，避免到处写 `if s.i2v else ""`）──
+    @property
+    def author_prompt(self) -> str:
+        """该镜**人工写的**画面提示词（ADR-073 / ADR-077）。"""
+        return (self.i2v.authorPrompt if self.i2v else "") or ""
+
+    @property
+    def motion_plan(self) -> DspShotMotion | None:
+        """该镜的**运镜方案**（ADR-076 / ADR-077；None = 摄影机固定）。"""
+        return self.i2v.motion if self.i2v else None
+
+    @property
+    def asset_key(self) -> str:
+        """该镜**最终选定的图**（空 = 缺口）。"""
+        return (self.image.assetKey if self.image else "") or ""
 
 
 class DspMaterial(BaseModel):

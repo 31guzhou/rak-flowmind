@@ -31,10 +31,13 @@
 （旧 MediaKit ``apply-camera-motion`` 路径已退役，留着就是同一运动施加两次）。
 
 选图口径（契约 §3.2，**不臆造素材**）：
-1. 镜头给了 ``clipKeys`` → 用指名的图；
+1. 镜头给了**指名的图**（ADR-077：`shots[].image.assetKey`）→ 用它；
 2. 否则从 ``materials`` 里按 ``needKind == category`` 选图，**优先取与上一镜不同的一张**
    （否则拆镜拆出的两半复用同一张图，画面观感等同没切）；
 3. 选不到 → 该镜**留空位**并在 ``notes`` 里如实说明。
+
+**四块（ADR-077）**：画面提示词取 `i2v.authorPrompt`、指名图取 `image.assetKey`、运镜方案取
+`i2v.motion`（旧扁平字段由 `DspShot._lift_legacy` 提升，故旧 run 的 spec 原样重跑仍能跑）。
 
 出参：``{edl, edlKey, durationSource, notes}``；EDL json 落 ``{cachePrefix}/{runId}/timeline/edl.json``。
 
@@ -153,15 +156,19 @@ def _sentence_rows(tts: dict[str, Any] | None) -> list[align.AlignSentence]:
 
 
 def _cut_shots(inp: TimelineBuildInput) -> list[align.CutShot]:
-    """下发镜头 → 收口所需的视图（比例兜底的**权重由文案字数自算**，不再有 weight 字段）。"""
+    """下发镜头 → 收口所需的视图（比例兜底的**权重由文案字数自算**，不再有 weight 字段）。
+
+    ADR-077：画面提示词 / 指名图 / 运镜方案一律**从四块读**（`author_prompt` / `asset_key` /
+    `motion_plan` 三个便捷属性；旧扁平字段由 `DspShot._lift_legacy` 提升，故老快照照常能跑）。
+    """
     return [
         align.CutShot(
             id=s.id,
             copy=s.copy_text,
-            visual_prompt=s.visualPrompt,
+            visual_prompt=s.author_prompt,
             need_kind=s.needKind,
-            clip_keys=tuple(s.clipKeys),
-            motion=s.motion,  # ADR-076：运镜方案原样进收口（并镜取主导、拆镜共用）
+            clip_keys=(s.asset_key,) if s.asset_key else (),
+            motion=s.motion_plan,  # ADR-076：运镜方案原样进收口（并镜取主导、拆镜共用）
             transition_after=(s.transitionAfter or None),
         )
         for s in inp.shots
