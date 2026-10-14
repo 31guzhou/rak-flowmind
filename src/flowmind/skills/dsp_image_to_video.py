@@ -17,10 +17,15 @@
 只缩不放；降采样失败**回落原图并如实告警**（画质风险，不是成片失败）。
 开关 ``FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT=0`` 可关。
 
-链路位置：``timeline``（锁时长）→ **本步** → ``render`` 侧对片段加运镜并拼成成片。
+链路位置：``timeline``（锁时长）→ **本步** → ``render`` 侧把片段铺上主轨拼成成片。
+
+**裁到镜头窗口**（ADR-080 阶段 5）：出片后本地 ffmpeg 把每镜裁到**锁定的镜头窗口**——超长裁掉、
+不足则**末帧定格**补齐并如实报 ``shortfallMs``（``trim`` 随 ``ShotClip`` 带出，render 侧透进剪辑记录）。
+两个行为各配 env 开关（``FLOWMIND_DSP_VIDEOGEN_TRIM_WINDOW`` / ``..._FREEZE_PAD``，默认都开）；
+裁切失败（本机无 ffmpeg / 编码器缺失）**回落原片段 + 如实告警**，不丢镜。
 
 粒度与时长：**一镜一段**；镜头建议时长（``shots[].durationMs``）按秒下发给模型
-（文档：``seconds`` 取值视模型而定，本仓**原样下发、不夹取**）。
+（文档：``seconds`` 取值视模型而定，本仓**原样下发、不夹取**），出片后再由本步裁到窗口。
 
 降级 **degrade**（本步为可关开关 ``videoGen`` 控制的增强步）：
 - 某镜生成失败 → **该镜不出片段**（render 侧回落静图）+ ``warnings`` 如实说明；
@@ -77,7 +82,7 @@ class ImageToVideoInput(DspBaseInput):
 
 
 class ShotClip(BaseModel):
-    """单镜视频片段（供 render 侧作 ``video`` 元素）+ **质检的测量产物**（ADR-079）。"""
+    """单镜视频片段（供 render 侧作 ``video`` 元素）+ **质检的测量产物**（ADR-079）+ **裁切实况**（ADR-080）。"""
     shotId: str
     key: str = Field(..., description="片段的云存储 key")
     atMs: int
@@ -90,6 +95,11 @@ class ShotClip(BaseModel):
         default_factory=dict,
         description="**客观量**（PIL 本地算，无需 numpy）：分辨率 / 逐帧平均亮度 / 相邻帧差异 / "
                     "黑帧与疑似冻结帧计数。**是测量不是判决**（阈值见 `_dsp_qc`）")
+    trim: common.DspEditTrim = Field(
+        default_factory=common.DspEditTrim,
+        description="**裁切实况**（ADR-080）：已把片段裁到镜头窗口（`sourceMs` = 源实测时长、"
+                    "`outMs` = 裁/补后时长、`shortfallMs` > 0 = 源比窗口短、已按末帧定格补齐）。"
+                    "**全 0 = 未裁切/未实测**（开关关、裁切失败、或复用上次产物）——render 侧原样透出")
 
 
 class ImageToVideoData(BaseModel):
@@ -348,25 +358,59 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             continue
         submitted.append((job, task_id))
 
-    # ── 收片 → 转存（文档：直链临时保存 24h，绝不当 key）→ （qc 开时）抽帧 + 客观量 ──
+    # ── 收片 → 裁到镜头窗口（ADR-080） → 转存 → （qc 开时）抽帧 + 客观量 ──
     clips: list[ShotClip] = list(reused_clips)
     qc_measured = 0
+    trimmed = 0        # 源比窗口长、真裁掉的镜数
+    cut_ms = 0         # 共裁掉多少 ms
+    padded = 0         # 源比窗口短、真按末帧定格补齐的镜数
+    pad_ms = 0         # 共补齐多少 ms
+    short_unpadded: list[str] = []   # 比窗口短但**未补**（`freeze_pad` 关）的镜
+    trim_failed = 0
     for job, task_id in submitted:
         frames: list[str] = []
         frame_stats: dict[str, Any] = {}
+        trim = common.DspEditTrim()
         try:
             raw = videogen.wait(cfg, task_id)
             url = videogen.result_url(raw)
             key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
             with tempfile.TemporaryDirectory(prefix="dsp-i2v-") as tmp:
                 local = storage.fetch_to_file(url, str(Path(tmp) / f"{job.shot_id}.mp4"))
-                storage.put_file(local, key, content_type="video/mp4")
+                # **裁到镜头窗口**（ADR-080）：模型给的时长与 timeline 锁定的窗口不是同一个数——
+                # 超长会顶到下一镜、不足会让该镜提前卡住。失败**回落原片段 + 如实告警，不丢镜**
+                # （与输入降采样同款纪律：画质/节奏风险 ≠ 成片失败）。
+                upload = local
+                if cfg.videogen_trim_window:
+                    try:
+                        fit = media.clip_to_window(
+                            local, str(Path(tmp) / f"{job.shot_id}.fit.mp4"),
+                            job.duration_ms, freeze_pad=cfg.videogen_freeze_pad)
+                        upload = fit.path
+                        trim = common.DspEditTrim(
+                            sourceMs=fit.sourceMs, outMs=fit.outMs, shortfallMs=fit.shortfallMs)
+                        if fit.sourceMs > job.duration_ms:
+                            trimmed += 1
+                            cut_ms += fit.sourceMs - job.duration_ms
+                        elif fit.shortfallMs > 0:
+                            if fit.outMs > fit.sourceMs:      # 真补齐了
+                                padded += 1
+                                pad_ms += fit.shortfallMs
+                            else:                             # 未补（定格开关关）——照实列出
+                                short_unpadded.append(
+                                    f"{job.shot_id}（短 {fit.shortfallMs}ms）")
+                    except media.MediaError as exc:
+                        trim_failed += 1
+                        warnings.append(
+                            f"镜头 {job.shot_id} 裁到镜头窗口失败（{exc}）——**原片段照常入库**"
+                            "（未裁切；剪辑记录里该镜的 trim 按 0 如实上报）")
+                storage.put_file(upload, key, content_type="video/mp4")
                 # **质检的测量侧**（ADR-079）：qc 开关开时才抽帧 + 算客观量（ffmpeg 免费但耗时，帧要上传）。
                 # 判定与重试调度在**前端质检层**；本侧**只测量**。失败即**如实告警并放弃本次测量**——
                 # 抽帧失败仍要保住这一镜的片段（画质风险 ≠ 丢镜），**绝不伪造帧或统计**。
                 if inp.switches.qc:
                     try:
-                        sample = qc.sample_frames(local, tmp, job.duration_ms / 1000.0)
+                        sample = qc.sample_frames(upload, tmp, job.duration_ms / 1000.0)
                         frame_stats = qc.frame_stats(sample.paths)
                         for i, path in enumerate(sample.paths):
                             fkey = common.step_key(
@@ -381,7 +425,27 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             warnings.append(f"镜头 {job.shot_id} 出片/转存失败：{exc}——该镜回落静图")
             continue
         clips.append(ShotClip(shotId=job.shot_id, key=key, atMs=job.at_ms,
-                              durationMs=job.duration_ms, frames=frames, frameStats=frame_stats))
+                              durationMs=job.duration_ms, frames=frames,
+                              frameStats=frame_stats, trim=trim))
+
+    if trimmed or padded:
+        bits: list[str] = []
+        if trimmed:
+            bits.append(f"裁到镜头窗口 {trimmed} 镜（共裁掉 {cut_ms}ms）")
+        if padded:
+            bits.append(f"源片段不足、末帧定格补齐 {padded} 镜（共 {pad_ms}ms）")
+        warnings.append("；".join(bits) + "——逐镜实况见各片段的 trim。")
+    if short_unpadded:
+        warnings.append(
+            f"{len(short_unpadded)} 镜源片段比镜头窗口短且**未做定格补齐**（「末帧定格」开关关）："
+            f"{'、'.join(short_unpadded[:6])}{'…' if len(short_unpadded) > 6 else ''}"
+            "——这些镜会比时间线短（如实报出 shortfallMs，补不补是策略）。")
+    if not cfg.videogen_trim_window:
+        warnings.append("「裁到镜头窗口」开关关：片段**原样入库**（trim 实况按 0 上报）")
+    if regen and reused_clips and cfg.videogen_trim_window:
+        warnings.append(
+            f"{len(reused_clips)} 镜复用已有片段（沿用上次产物，未重新裁切）——"
+            "其 trim 实况不在本次测量范围（按 0 上报）")
 
     failed = len(jobs) - len(clips)
     if not clips:
@@ -398,6 +462,9 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         [f"运镜方案 {motion_planned} 镜"] if motion_planned else []) + (
         [f"固定机位 {no_motion} 镜"] if no_motion else []) + (
         [f"{motion_ignored} 镜有运镜方案但「运镜」开关已关，未下发"] if motion_ignored else []) + (
+        [f"裁到镜头窗口 {trimmed} 镜（裁掉 {cut_ms}ms）"] if trimmed else []) + (
+        [f"末帧定格补齐 {padded} 镜（{pad_ms}ms）"] if padded else []) + (
+        [f"裁切失败 {trim_failed} 镜（原片段照常入库）"] if trim_failed else []) + (
         [f"质检测量 {qc_measured} 镜（抽帧 + 客观量；判定在前端质检层）"] if qc_measured else [])
     return SkillOutput(
         data=ImageToVideoData(clips=clips, warnings=warnings),
@@ -418,6 +485,9 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                 + (f"另有 {no_motion} 镜按**固定机位**下发；" if no_motion else "")
                 + (f"{motion_ignored} 镜带方案但因「运镜」开关关闭被忽略；" if motion_ignored else "")
                 + "（本聚合端点**没有**运动入参，运镜只能靠提示词语言表达——是否真被执行**待真跑验证**）"
+                + (f"出片后本地 ffmpeg 裁到**锁定的镜头窗口**（ADR-080）：裁掉 {trimmed} 镜 / "
+                   f"末帧定格补齐 {padded} 镜" if (trimmed or padded) else "")
+                + ("；" if (trimmed or padded) else "")
                 + "直链（24h）已转存为不可变 key。"
             ),
             risk_note=(

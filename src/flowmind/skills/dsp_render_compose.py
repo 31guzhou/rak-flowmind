@@ -42,11 +42,17 @@ class RenderComposeInput(DspBaseInput):
 
 
 class RenderComposeData(BaseModel):
-    """出参：成片 key + 时长 + 分辨率（本仓就取 ``storedKey`` 当成品）。"""
+    """出参：成片 key + 时长 + 分辨率 + **逐镜剪辑记录**（本仓就取 ``storedKey`` 当成品）。"""
     storedKey: str
     durationMs: int
     width: int
     height: int
+    editSegments: list[common.DspEditSegment] = Field(
+        default_factory=list,
+        description="**逐镜剪辑记录**（ADR-080 阶段 5）：该镜在成片时间轴上的起点 / 剪辑时长 / 用哪个视频或"
+                    "静图 / 覆盖的音轨 / **实际施加**的转场（null = 硬切）/ 裁切实况 / 降级模式。"
+                    "**只报实况**——镜头上的 `transitionAfter` 是请求，未登记厂商资源 ID 的转场在此如实为 null。"
+                    "前端落库后在成片任务的「剪辑记录」区逐镜展示")
     note: str = ""
     warnings: list[str] = Field(default_factory=list)
 
@@ -70,6 +76,79 @@ def _split_stickers(raw: object) -> tuple[list[dict], list[str]]:
                 ref = (sticker.get("productRef") or {}).get("value", "")
                 notes.append(f"贴片（商品锚点 {ref or '未给'}）为平台组件，未烧进画面")
     return burnable, notes
+
+
+def _edit_segments(
+    edl: common.DspEdl,
+    clip_by_shot: dict[str, dict],
+    *,
+    audio_key: str,
+    bgm_key: str,
+    bgm_requested: bool,
+    transition_region: str = "cn-north",
+) -> list[common.DspEditSegment]:
+    """EDL + 逐镜片段 → **逐镜剪辑记录**（ADR-080 阶段 5）。
+
+    **只报实况，不报请求**（ADR-077 的核心纪律）：镜头上的 ``transitionAfter`` 是**请求**，
+    ``edit.transition`` 是**真加进轨的**——未登记厂商资源 ID 的转场在渲染里已回落硬切，
+    故这里如实为 ``None``（硬切），并在 ``note`` 里写明原因。
+
+    与 ``build_tracks`` **同一索引口径**（EDL image 轨 ``segments[i]`` ↔ ``edl.shots[i]``），
+    故两者不会错位。无片段 ⇒ ``fallback_still``；连图都没有 ⇒ ``missing_clip``（该镜没进片子，
+    如实落一条而不是从记录里消失）。
+    """
+    image_tracks = [t for t in edl.tracks if t.kind == "image"]
+    if not image_tracks:
+        return []
+    segs: list[common.DspEditSegment] = []
+    for idx, seg in enumerate(image_tracks[0].segments):
+        shot = edl.shots[idx] if idx < len(edl.shots) else None
+        shot_id = shot.id if shot is not None else f"s{idx + 1}"
+        clip = clip_by_shot.get(shot_id) or {}
+        video_key = str(clip.get("key") or "")
+        notes: list[str] = []
+
+        # 转场：符号名 → 厂商资源 ID。未登记 / 只支持交叠 ⇒ 渲染侧已回落硬切（见 transition_filters）
+        requested = (seg.transition or "").strip()
+        entry = mediakit.resolve_transition(requested, transition_region)
+        applied: str | None = None
+        if requested and entry and str(entry.get("mode") or "") == "non-overlap":
+            applied = requested
+        elif requested:
+            notes.append(f"转场 {requested} 未登记厂商资源 ID，实况**硬切**")
+
+        if video_key:
+            degrade = ""
+        elif seg.sourceKey:
+            degrade = "fallback_still"
+            notes.append("无图生视频片段，**回落静图**")
+        else:
+            degrade = "missing_clip"
+            notes.append("既无片段也无静图（**空段**，该镜未进片子）")
+
+        raw_trim = clip.get("trim")
+        trim = common.DspEditTrim()
+        if isinstance(raw_trim, dict):
+            try:
+                trim = common.DspEditTrim.model_validate(raw_trim)
+            except Exception:  # noqa: BLE001  形状不对 ⇒ 按「未实测」如实归零（不猜）
+                notes.append("裁切实况形状不合法——按未实测（全 0）记录")
+        if trim.shortfallMs > 0:
+            notes.append(f"源片段比镜头窗口短 {trim.shortfallMs}ms，已按**末帧定格**补齐")
+        elif trim.sourceMs > seg.durationMs:
+            notes.append(f"源片段 {trim.sourceMs}ms 超窗口，已裁掉 {trim.sourceMs - seg.durationMs}ms")
+
+        if bgm_requested and not bgm_key:
+            notes.append("无 BGM（**选曲能力未接通，恒降级**）")
+
+        segs.append(common.DspEditSegment(
+            shotId=shot_id, atMs=seg.atMs, durationMs=seg.durationMs,
+            videoKey=video_key, imageKey=seg.sourceKey,
+            voKey=audio_key, bgmKey=bgm_key,
+            transition=applied, trim=trim, degradeMode=degrade,
+            note="；".join(notes),
+        ))
+    return segs
 
 
 # **运镜施加已退役**（ADR-076）：旧路径 `apply-camera-motion` 是对**已生成片段**做事后 pan-zoom，
@@ -144,8 +223,11 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
     stickers, sticker_notes = _split_stickers(cart.get("stickers"))
     warnings.extend(sticker_notes)
 
-    # 转场（ADR-070）：EDL 记的是**符号名**，未登记厂商资源 ID 的会被如实回落硬切——在此告警。
-    warnings.extend(mediakit.transition_warnings(edl))
+    # 转场（ADR-070/080）：EDL 记的是**符号名**，未登记厂商资源 ID 的会被如实回落硬切——在此告警。
+    # 传入有片段的镜 id：厂商文档的转场适用范围是「同轨道相邻两 **Video**」，相邻含**静图**时会追加
+    # 「静图邻接是否生效未经实测」的告警（**文档支持范围 ≠ 我们实际用到的形态**）。
+    warnings.extend(mediakit.transition_warnings(
+        edl, set(clip_by_shot), region=cfg.mediakit_transition_region))
 
     tracks = mediakit.build_tracks(
         edl,
@@ -157,6 +239,7 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
         subtitle_font_size=inp.subtitleFontSize,
         canvas_width=cfg.mediakit_canvas_width,
         canvas_height=cfg.mediakit_canvas_height,
+        transition_region=cfg.mediakit_transition_region,
     )
     if not tracks:
         raise mediakit.DspMediakitError(
@@ -194,11 +277,32 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
     if result.get("resolution"):
         warnings.append(f"MediaKit 实际分辨率：{result['resolution']}")
 
-    note = f"成片 {duration_ms}ms → {final}"
+    # ── 逐镜**剪辑记录**（ADR-080）：只报实况（未被施加的转场在这里就是硬切） ──
+    edit_segments = _edit_segments(
+        edl, clip_by_shot,
+        audio_key=audio_key,
+        bgm_key=str(bgm.get("bgmKey") or ""),
+        bgm_requested=common.dep(inp.deps, "bgm") is not None,
+        transition_region=cfg.mediakit_transition_region,
+    )
+    still_used = sum(1 for s in edit_segments if s.degradeMode == "fallback_still")
+    missing = sum(1 for s in edit_segments if s.degradeMode == "missing_clip")
+    if edit_segments:
+        warnings.append(
+            f"剪辑记录 {len(edit_segments)} 段：视频 {len(edit_segments) - still_used - missing} 段 / "
+            f"静图回落 {still_used} 段" + (f" / 空段 {missing} 段" if missing else "")
+            + "（逐镜实况见 editSegments）"
+        )
+
+    note = (f"成片 {duration_ms}ms → {final}"
+            + (f"；剪辑记录 {len(edit_segments)} 段（视频 "
+               f"{len(edit_segments) - still_used - missing} / 静图 {still_used}"
+               + (f" / 空段 {missing}" if missing else "") + "）" if edit_segments else ""))
     return SkillOutput(
         data=RenderComposeData(
             storedKey=final, durationMs=duration_ms,
             width=cfg.mediakit_canvas_width, height=cfg.mediakit_canvas_height,
+            editSegments=edit_segments,
             note=note, warnings=warnings,
         ),
         reasoning=[common.chain(
@@ -206,10 +310,13 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
             causal_analysis=(
                 f"按锁定 EDL（totalMs={edl.totalMs}ms）铺 {len(tracks)} 轨；"
                 f"主轨 {len(clip_urls)} 段视频片段 + {len(still_keys)} 张静图；"
-                "字幕/贴片/封面位一次性烧制；AIGC 标识元数据已注入。"
+                "字幕/贴片/封面位一次性烧制；AIGC 标识元数据已注入；"
+                f"逐镜剪辑记录 {len(edit_segments)} 段（含裁切实况与**实际施加**的转场）。"
             ),
             risk_note=(
                 "渲染为一次性烧制（不可再编辑）；成片已转存为不可变 key，重跑 = 新 runId = 新 key。"
+                + (" 有镜既无片段也无图 ⇒ 该段为空（成片里是一段黑/空位），已在剪辑记录标 missing_clip。"
+                   if missing else "")
             ),
         )],
         confidence=1.0,

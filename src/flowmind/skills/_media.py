@@ -1,6 +1,6 @@
 """ffmpeg 薄封装：视频/音频的机械媒体操作。
 
-只做非 AI 的媒体处理（提音轨/探时长/抽帧/等比缩放/擦除区域/烧字幕/混音），
+只做非 AI 的媒体处理（提音轨/探时长/抽帧/等比缩放/擦除区域/烧字幕/混音/裁到时长窗口），
 一切智能环节（ASR/TTS/翻译/OCR）走云 API——见 CLAUDE.md 云优先原则。
 命令通过 run_ffmpeg/run_ffprobe 间接执行，测试可注入 fake；
 图片的探尺寸 / 等比缩放走惰性 PIL（不经命令行，故无 fake 注入点）。
@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from typing import NamedTuple
 
 
 class MediaError(Exception):
@@ -72,6 +73,89 @@ def extract_frame(video_path: str, timestamp_s: float, out_path: str) -> str:
     if rc != 0:
         raise MediaError(f"抽帧失败: {err[-200:]}")
     return out_path
+
+
+class ClipFit(NamedTuple):
+    """裁到镜头窗口的结果（ADR-080 阶段 5「剪辑引擎」的裁切实况）。
+
+    ``path`` 是**实际可用的片段路径**——未裁切时 = 入参原路径（调用方据此决定要不要落派生件）。
+    ``sourceMs`` = 源片段实测时长、``outMs`` = 裁/补后时长、``shortfallMs`` = 源片段**比窗口短**多少
+    （>0 且 ``path != video_path`` ⇒ 已按**末帧定格**补齐并把画面拖满窗口）。
+    """
+
+    path: str
+    sourceMs: int
+    outMs: int
+    shortfallMs: int
+    trimmed: bool
+
+
+def clip_to_window(
+    video_path: str,
+    out_path: str,
+    window_ms: int,
+    *,
+    source_ms: int | None = None,
+    freeze_pad: bool = True,
+) -> ClipFit:
+    """把片段裁到**镜头窗口**（``window_ms``）：超长裁掉、不足按末帧定格补齐。
+
+    为什么需要它：图生视频模型给的时长只是「建议值附近」，与 ``timeline`` 锁定的镜头窗口**不是同一个数**
+    ——多出来的部分会**顶到下一镜**（观众看到上一镜画面多停一截），不足的部分会让该镜**提前黑/卡**
+    （后面镜头往前挤）。故出片后在本侧用 ffmpeg 把每镜**裁到窗口**（ADR-080）。
+
+    行为（三段，各自如实记进 ``ClipFit``）：
+      ① 源 = 窗口 ⇒ **原样返回**（不重编码、不落派生件）；
+      ② 源 > 窗口 ⇒ ``-t`` **裁掉**尾部，``outMs = window_ms``、``shortfallMs = 0``；
+      ③ 源 < 窗口 ⇒ ``freeze_pad`` 时用 ``tpad=stop_mode=clone`` **末帧定格**补齐到窗口
+         （``outMs = window_ms``、``shortfallMs = 源与窗口之差``）；``freeze_pad=False`` 则**不补**
+         （``outMs = source_ms``），但 ``shortfallMs`` **照实报出**——补不补是策略，短不短是事实。
+
+    编码：走 ``libx264 + yuv420p`` 重编码（`-c copy` 只能按关键帧切，给不出精确窗口）。
+    片段的**自带音轨丢弃**（``-an``）——成片音轨由 ``timeline`` 锁定的 tts/bgm 轨铺，I2V 片段本就不带口播；
+    真要保留片段音轨得另立参数位（当前不需要）。
+
+    ``source_ms`` 给定则不探（调用方已知时省一次 ffprobe）；未给即 ``probe_media`` 实测。
+    ffmpeg/ffprobe 缺失或命令失败 ⇒ 抛 ``MediaError``（调用方**如实告警并保留原片段**，绝不假装裁过）。
+    """
+    if window_ms <= 0:
+        raise MediaError(f"镜头窗口必须 > 0（当前 {window_ms}ms）")
+    if source_ms is None:
+        try:
+            source_ms = int(round(probe_media(video_path)[0] * 1000))
+        except FileNotFoundError as exc:  # ffprobe 不在（与 _dsp_qc 同口径：裸 FileNotFoundError）
+            raise MediaError("本机没有 ffprobe——无法实测片段时长，裁切不可用") from exc
+    if source_ms <= 0:
+        raise MediaError("源片段时长未知（0）——不猜，跳过裁切")
+
+    if source_ms == window_ms:
+        return ClipFit(video_path, source_ms, source_ms, 0, False)
+
+    if source_ms > window_ms:
+        _cut(video_path, out_path, window_ms, freeze_s=None)
+        return ClipFit(out_path, source_ms, window_ms, 0, True)
+
+    shortfall = window_ms - source_ms
+    if not freeze_pad:
+        return ClipFit(video_path, source_ms, source_ms, shortfall, False)
+    _cut(video_path, out_path, window_ms, freeze_s=shortfall / 1000.0)
+    return ClipFit(out_path, source_ms, window_ms, shortfall, True)
+
+
+def _cut(video_path: str, out_path: str, window_ms: int, *, freeze_s: float | None) -> None:
+    """落一次裁切/定格命令（``freeze_s`` 给定即先 ``tpad`` 克隆末帧补足）。"""
+    cmd = ["ffmpeg", "-y", "-i", video_path]
+    if freeze_s:
+        cmd += ["-vf", f"tpad=stop_mode=clone:stop_duration={freeze_s:.3f}"]
+    cmd += ["-t", f"{window_ms / 1000.0:.3f}",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", out_path]
+    try:
+        rc, _, err = run_ffmpeg(cmd)
+    except FileNotFoundError as exc:  # ffmpeg 不在（实测为裸 FileNotFoundError）
+        raise MediaError("本机没有 ffmpeg——裁切不可用（如实跳过，不假装裁过）") from exc
+    if rc != 0:
+        raise MediaError(
+            f"{'末帧定格补齐' if freeze_s else '裁到镜头窗口'}失败: {err[-200:]}")
 
 
 def _pil():  # noqa: ANN202  惰性导入 Pillow（类型不便标注）

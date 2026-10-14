@@ -16,6 +16,10 @@
 10. **运镜（ADR-076）**：经引擎适配器并入 prompt——「运镜」开关关 ⇒ 逐镜下**固定机位**条款；
    开 ⇒ 用该镜方案（Agent 的 positive 优先、否则确定性短语）；有方案但开关关 ⇒ 忽略并如实告警；
    词表外符号 ⇒ 空短语不硬凑；**引擎参数位恒空**（本聚合端点无运动入参）
+12. **质检的测量侧（ADR-079）**：有界重试 / 按镜复用 / qc 开=抽帧+客观量、关=不抽不测 / 抽帧失败不丢镜
+13. **裁到镜头窗口（ADR-080 阶段 5）**：超长裁掉 / 不足**末帧定格**补齐并如实报 `shortfallMs` /
+    两个 env 开关（`TRIM_WINDOW` / `FREEZE_PAD`）/ 裁切失败**回落原片段**不丢镜
+    —— 本机**无 ffmpeg**，故裁切靠**注入假 ffmpeg/ffprobe** 离线真跑（断言命令行与 trim 统计）
 
 mock 方式：替换 ``_dsp_video_gen`` 的 submit/wait（模块级薄适配层）与 ``_dsp_storage``
 的 presign/fetch/put_file，不需要网络 / 厂商密钥 / 对象存储。密钥用假值经 env 注入。
@@ -24,6 +28,7 @@ mock 方式：替换 ``_dsp_video_gen`` 的 submit/wait（模块级薄适配层�
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -43,11 +48,17 @@ _FAIL_SHOTS: set[str] = set()
 # ADR-079 用：提交时**前 N 次**抛「瞬时（retriable）」错（验有界重试）；以及「已存在的对象」（验按镜复用）。
 _TRANSIENT_FAILS = {"n": 0}
 _EXISTS: set[str] = set()
+# ADR-080 用：假 ffmpeg/ffprobe（本开发机**没有** ffmpeg）——按文件名给「源片段时长」，
+# 于是「超长裁掉」与「不足末帧定格」两条路径都能在本机**离线真跑**（断言命令行与 trim 统计）。
+_FFMPEG_CMDS: list[list[str]] = []
+_SOURCE_MS = {"s1.mp4": 5200, "s2.mp4": 1500}   # s1 超窗口(3000) / s2 不足窗口(4000)
 
 # 素材池里这些图的**实际像素**（按文件名匹配）：补生图 = 9:16 @2K（超 I2V 输出 720×1280），
 # 另一张 = 小图（未超 ⇒ 原图直用，不落派生件）。
 _IMAGE_PIXELS = {"门头1.jpg": (1152, 2048), "杯1.jpg": (600, 900)}
 _REAL_PROBE = media.probe_image_size
+_REAL_FFMPEG = media.run_ffmpeg
+_REAL_FFPROBE = media.run_ffprobe
 
 
 def section(title: str) -> None:
@@ -103,12 +114,28 @@ def _install_fakes() -> None:
     def exists(key: str) -> bool:
         return key in _EXISTS
 
+    # ── 假 ffmpeg / ffprobe（ADR-080）：本机没有 ffmpeg，故裁切路径靠**注入假件**验证 ──
+    # ffprobe 按**文件名**报源片段时长（`_SOURCE_MS`），ffmpeg 只记录命令行并落一个占位文件。
+    # 于是「超长裁掉 / 不足末帧定格」两条路径**在本机离线真跑**，命令行与 trim 统计都被断言。
+    def run_ffprobe(cmd: list[str], **kw) -> tuple[int, str, str]:
+        ms = _SOURCE_MS.get(Path(cmd[-1]).name, 3000)
+        out = json.dumps({"format": {"duration": f"{ms / 1000:.3f}"},
+                          "streams": [{"width": 720, "height": 1280}]})
+        return 0, out, ""
+
+    def run_ffmpeg(cmd: list[str], **kw) -> tuple[int, str, str]:
+        _FFMPEG_CMDS.append(list(cmd))
+        Path(cmd[-1]).write_bytes(b"\x00\x00\x00\x18ftypmp42")
+        return 0, "", ""
+
     videogen.submit = submit
     videogen.wait = wait
     storage.fetch_to_file = fetch_to_file
     storage.put_file = put_file
     storage.presign_get = presign_get
     storage.exists = exists
+    media.run_ffprobe = run_ffprobe
+    media.run_ffmpeg = run_ffmpeg
 
 
 def _edl() -> dict:
@@ -154,6 +181,7 @@ def _reset() -> None:
     _FAIL_SHOTS.clear()
     _EXISTS.clear()
     _TRANSIENT_FAILS["n"] = 0
+    _FFMPEG_CMDS.clear()
 
 
 def main() -> None:
@@ -413,7 +441,8 @@ def main() -> None:
               "客观量随片段带出（分辨率 / 亮度 / 差异 / 黑帧与冻结帧计数）")
         check(calls["n"] == len(r.data.clips), "每镜各抽一次（不重复抽）")
 
-        _reset(); calls["n"] = 0
+        _reset()
+        calls["n"] = 0
         r = invoke("image_to_video", _ctx(switches={"qc": False}))
         check(calls["n"] == 0 and all(not c.frames for c in r.data.clips),
               "qc 关 ⇒ 不抽帧不测（不产生额外开销）")
@@ -431,6 +460,81 @@ def main() -> None:
               "抽帧失败须如实告警（不伪造帧 / 不伪造统计）")
     finally:
         qc.sample_frames, qc.frame_stats = real_sample, real_stats
+
+
+    # ── 13) 裁到镜头窗口（ADR-080 阶段 5「剪辑引擎」）──
+    section("13) 裁到镜头窗口（ADR-080）：超长裁掉 / 不足末帧定格补齐 / 两个 env 开关")
+
+    # 13a) 超长与不足：s1 源 5200ms > 窗口 3000ms ⇒ 裁掉 2200ms；
+    #      s2 源 1500ms < 窗口 4000ms ⇒ tpad 克隆末帧补齐 2500ms 并如实报 shortfallMs
+    _reset()
+    r = invoke("image_to_video", _ctx())
+    by_shot = {c.shotId: c for c in r.data.clips}
+    print(f"  s1 trim   : {by_shot['s1'].trim}")
+    print(f"  s2 trim   : {by_shot['s2'].trim}")
+    for cmd in _FFMPEG_CMDS:
+        print(f"  ffmpeg    : {' '.join(cmd)}")
+    check(by_shot["s1"].trim.sourceMs == 5200 and by_shot["s1"].trim.outMs == 3000
+          and by_shot["s1"].trim.shortfallMs == 0, "超长镜：源 5200ms 裁到窗口 3000ms（shortfall 0）")
+    check(by_shot["s2"].trim.sourceMs == 1500 and by_shot["s2"].trim.outMs == 4000
+          and by_shot["s2"].trim.shortfallMs == 2500,
+          "不足镜：源 1500ms 补到窗口 4000ms，并**如实报出** shortfallMs")
+    s1_cmd = next(c for c in _FFMPEG_CMDS if "s1.mp4" in " ".join(c))
+    s2_cmd = next(c for c in _FFMPEG_CMDS if "s2.mp4" in " ".join(c))
+    check("-t" in s1_cmd and "3.000" in s1_cmd and not any("tpad" in a for a in s1_cmd),
+          "超长镜的命令行 = 纯 `-t` 裁到窗口（不补帧）")
+    check(any(a == "tpad=stop_mode=clone:stop_duration=2.500" for a in s2_cmd) and "4.000" in s2_cmd,
+          "不足镜的命令行 = tpad 克隆末帧 2.5s + `-t` 4.000（定格补齐到窗口）")
+    check(all(c[-1].endswith(".fit.mp4") for c in _FFMPEG_CMDS), "裁切产物落派生件（原片段不就地改写）")
+    check(any("裁到镜头窗口 1 镜" in w for w in r.data.warnings)
+          and any("末帧定格补齐 1 镜" in w for w in r.data.warnings),
+          "裁切与补齐**如实计入告警**（不静默）")
+    check("dsp/scratch/t1/run-demo-8/clips/s1.mp4" in _PUTS
+          and "dsp/scratch/t1/run-demo-8/clips/s2.mp4" in _PUTS,
+          "裁切后片段仍落**确定性 key** clips/{shotId}.mp4（render / 按镜复用的 key 口径不变）")
+
+    # 13b) 关「裁到镜头窗口」⇒ 一次 ffmpeg 都不跑、trim 全 0（未实测，不猜）、如实告警
+    os.environ["FLOWMIND_DSP_VIDEOGEN_TRIM_WINDOW"] = "0"
+    _reset()
+    r = invoke("image_to_video", _ctx())
+    print(f"  关裁切 trim: {[c.trim for c in r.data.clips]}")
+    check(not _FFMPEG_CMDS, "关裁切 ⇒ 一次 ffmpeg 都不跑")
+    check(all(c.trim.sourceMs == 0 and c.trim.outMs == 0 and c.trim.shortfallMs == 0
+              for c in r.data.clips), "关裁切 ⇒ trim 全 0（未实测，不猜一个数出来）")
+    check(any("开关关" in w for w in r.data.warnings), "关裁切须如实告警")
+    os.environ.pop("FLOWMIND_DSP_VIDEOGEN_TRIM_WINDOW")
+
+    # 13c) 关「末帧定格」⇒ 不补（outMs = 源长），但 shortfallMs **照实报出**
+    os.environ["FLOWMIND_DSP_VIDEOGEN_FREEZE_PAD"] = "0"
+    _reset()
+    r = invoke("image_to_video", _ctx())
+    by_shot = {c.shotId: c for c in r.data.clips}
+    print(f"  关定格 s2 : {by_shot['s2'].trim}")
+    check(by_shot["s2"].trim.sourceMs == 1500 and by_shot["s2"].trim.outMs == 1500
+          and by_shot["s2"].trim.shortfallMs == 2500,
+          "关定格 ⇒ **不补**（outMs = 源长），但**短多少照实报**（补不补是策略，短不短是事实）")
+    check(by_shot["s1"].trim.outMs == 3000 and by_shot["s1"].trim.shortfallMs == 0,
+          "关定格不影响**超长**镜的裁切（两个开关彼此独立）")
+    check(any("未做定格补齐" in w for w in r.data.warnings), "未补须**如实列出**（不静默）")
+    os.environ.pop("FLOWMIND_DSP_VIDEOGEN_FREEZE_PAD")
+
+    # 13d) 裁切失败（本机无 ffmpeg）⇒ **回落原片段** + 如实告警（画质/节奏风险 ≠ 丢镜）
+    _reset()
+
+    def _no_ffmpeg(cmd, **kw):
+        raise FileNotFoundError("ffmpeg")
+
+    media.run_ffmpeg = _no_ffmpeg
+    try:
+        r = invoke("image_to_video", _ctx())
+    finally:
+        media.run_ffmpeg = _REAL_FFMPEG
+    print(f"  裁切失败 warnings: {[w for w in r.data.warnings if '裁切' in w]}")
+    check(len(r.data.clips) == 2, "裁切失败**不丢镜**（原片段照常入库）")
+    check(all(c.trim.sourceMs == 0 and c.trim.outMs == 0 for c in r.data.clips),
+          "裁切失败 ⇒ trim 按 0 如实上报（不假装裁过）")
+    check(any("裁到镜头窗口失败" in w for w in r.data.warnings), "裁切失败须如实告警")
+    check("裁切失败 2 镜" in r.reasoning[0].conclusion, "结论里如实带出裁切失败镜数")
 
 
     print("\n✅ dsp_image_to_video_demo 全部通过")

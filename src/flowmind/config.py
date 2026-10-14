@@ -358,6 +358,7 @@ _DSP_ENV_FIELDS: dict[str, str] = {
     "mediakit_api_base": "FLOWMIND_DSP_MEDIAKIT_API_BASE",
     "mediakit_queue_id": "FLOWMIND_DSP_MEDIAKIT_QUEUE_ID",
     "mediakit_output_destination": "FLOWMIND_DSP_MEDIAKIT_OUTPUT_DESTINATION",
+    "mediakit_transition_region": "FLOWMIND_DSP_MEDIAKIT_TRANSITION_REGION",
     "tts_api_base": "FLOWMIND_DSP_TTS_API_BASE",
     "tts_default_speaker": "FLOWMIND_DSP_TTS_SPEAKER",
     "timeline_silent_shot_ms": "FLOWMIND_DSP_TIMELINE_SILENT_SHOT_MS",
@@ -421,6 +422,9 @@ class DspConfig(BaseModel):
     mediakit_output_fps: int = 30
     mediakit_queue_id: str = Field(default="", validate_default=True)  # env FLOWMIND_DSP_MEDIAKIT_QUEUE_ID
     mediakit_aigc_label: str = "1"         # §7.3④ AIGC 标识（"1" = 含 AI 生成内容）
+    # 转场资源 ID 的**区域**（ADR-080）：厂商给的是**两张 ID 表**（华北 / 柔佛），同一效果两个号。
+    # 端点默认是 ``mediakit.cn-beijing``（华北）⇒ 缺省 ``cn-north``；换区域只改这个值（表里两个号都在）。
+    mediakit_transition_region: str = Field(default="cn-north", validate_default=True)
     mediakit_output_destination: str = Field(default="", validate_default=True)  # env FLOWMIND_DSP_MEDIAKIT_OUTPUT_DESTINATION
 
     # ── 火山豆包语音「音频生成」（tts_generate · §3.1）──
@@ -492,6 +496,16 @@ class DspConfig(BaseModel):
     # 素材图（补生 ``1152x2048``）是**静图主轨**口径（长边 ≥2048，缩到画布才不虚）——与 I2V 输入是
     # **同一张图的两个用途**，故在**输入侧**等比缩到 ``videogen_size`` 以内，**不动补生尺寸常量**。
     videogen_downscale_input: bool = Field(default=True, validate_default=True)
+    # ── 出片后**本地裁到镜头窗口**（ADR-080 阶段 5；env FLOWMIND_DSP_VIDEOGEN_TRIM_WINDOW=0 关）──
+    # 图生视频模型按「建议时长附近」出片，与 timeline 锁定的镜头窗口**不是同一个数**：多出来的会顶到
+    # 下一镜（画面多停一截）、不足的会让该镜提前卡住。故在转存前用 ffmpeg 把每镜裁到窗口。
+    # 关掉 ⇒ 片段原样入库（``trim`` 实况按 0 上报，前端剪辑记录如实标「未裁切」）。
+    # 裁切失败（本机无 ffmpeg / 编码器缺失）**回落原片段 + 如实告警**，不丢镜。
+    videogen_trim_window: bool = Field(default=True, validate_default=True)
+    # ── 不足时**末帧定格**补齐（ADR-080；env FLOWMIND_DSP_VIDEOGEN_FREEZE_PAD=0 关）──
+    # 源片段比窗口短 ⇒ ``tpad=stop_mode=clone`` 把末帧拖满窗口（画面在结尾静止一拍）。
+    # 关掉 ⇒ **不补**（该镜比时间线短），但 ``shortfallMs`` **照实报出**——补不补是策略，短不短是事实。
+    videogen_freeze_pad: bool = Field(default=True, validate_default=True)
 
     @field_validator(*_DSP_ENV_FIELDS, mode="before")
     @classmethod
@@ -513,14 +527,20 @@ class DspConfig(BaseModel):
             return True
         return v
 
-    @field_validator("videogen_bridge_next_image", "videogen_downscale_input", mode="before")
+    @field_validator(
+        "videogen_bridge_next_image", "videogen_downscale_input",
+        "videogen_trim_window", "videogen_freeze_pad",
+        mode="before",
+    )
     @classmethod
     def _env_videogen_flags(cls, v: bool, info: ValidationInfo) -> bool:
-        """两个 I2V 行为开关的 env 覆盖（1/true/yes 开，0/false/no 关；其余不生效）。"""
+        """I2V 行为开关的 env 覆盖（1/true/yes 开，0/false/no 关；其余不生效）。"""
         ensure_env_loaded()
         env_names = {
             "videogen_bridge_next_image": "FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE",
             "videogen_downscale_input": "FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT",
+            "videogen_trim_window": "FLOWMIND_DSP_VIDEOGEN_TRIM_WINDOW",
+            "videogen_freeze_pad": "FLOWMIND_DSP_VIDEOGEN_FREEZE_PAD",
         }
         raw = os.environ.get(env_names[info.field_name], "").strip().lower()
         if raw in ("1", "true", "yes"):

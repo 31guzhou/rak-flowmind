@@ -111,35 +111,86 @@ def mediakit_configured(cfg: DspConfig) -> bool:
 # 将来若要用引擎**参数级**运镜，落点同样是 `_dsp_video_gen.MOTION_ENGINE`。
 
 
-# ── 转场（extra 滤镜 · ADR-070）──────────────────────────────────
-# 厂商表达方式（契约 §7.2）：转场是**加在相邻两元素的「前一个」上的 extra 滤镜**——
-# ``extra: [{type: "transition", source: <资源 ID>, duration: <ms>}]``。
+# ── 转场（extra 滤镜 · ADR-070 / ADR-080）─────────────────────────
+# **厂商口径（用户 2026-10-14 提供的 TransitionFilter 参数说明）**：``TransitionFilter`` 加在**资源的
+# ``Extra`` 字段**里用来加转场；**同轨道相邻 A 视频与 B 视频**之间要转场，**只需加在 A（前一个）**上。
+# 参数三个都是必选：``Type = "transition"`` / ``Source = 转场 ID`` / ``Duration = 转场时长(ms)``。
+#   → 本仓映射（``transition_filters``）与之逐字对齐：``extra: [{type, source, duration}]`` 挂在
+#     **该段自己的元素**上（= 段 i 末尾、桥接 i→i+1，正是「加在 A 上」）。
+#   ⚠️ **文档写的是「两 Video」**，而本仓主轨在**未出片**时回落 ``image``（静图）元素——静图邻接是否
+#     同样生效**未经实测**（登记 B1b ③）。故 ``transition_warnings`` 在转场**真被施加**时，若相邻
+#     元素含静图会如实告警（**不假装**它和视频一样有效）。
 # **只允许「非交叠」**：音轨是一整条实测音频、时间线严格连续，交叠会移动画面内容或改总时长
 # ⇒ 音画失同步（硬约束，见 `_dsp_common.DspEdlSegment.transition`）。
 #
-# ⚠️ **本表当前为空**：火山 MediaKit 的**转场资源 ID 表不在本仓**（契约 §7.2 记着「文档附完整资源
-# ID 表」，那份文档未落到仓内）。故**未登记即不可用**——`resolve_transition` 返回 None、
-# `render_compose` 侧**如实回落硬切并告警**。**绝不编造 ID**（数据诚实）。
+# ⚠️ **本表当前只登记了一项**（`dissolve`）——厂商转场目录里**可用于非交叠**的那批里，
+# 与我们符号词表能**对得上**的只有「泛开」这一项（见 `TRANSITION_CATALOG`）。我们的另两个符号
+# （`wipe` / `fade-black`）在厂商目录里**没有可用于非交叠的对应项** ⇒ **查不到即不可用**，如实回落硬切。
+# **绝不编造 ID、也绝不把「否」的项当「是」用**（数据诚实）。
 # 拿到 ID 表后只填这一张表（与 cross-dashboard 的 `DSP_TRANSITION_VENDOR` 同源、同值）。
 TRANSITION_VENDOR: dict[str, dict[str, object]] = {
-    # 例："dissolve": {"id": "vcr//????", "mode": "non-overlap", "durationMs": 400},
+    # 本仓符号 `dissolve`（柔切）→ 厂商「泛开」（非交叠可用）。`durationMs` 是**本仓取值**
+    # （厂商只要求给 Duration，没给默认值）——400ms 是「看得出是个转场、又不吃掉太多镜头时长」的取值，
+    # 可按真跑观感在这一行改。
+    "dissolve": {"cnNorth": "1182358", "johor": "1109560",
+                 "mode": "non-overlap", "durationMs": 400},
+}
+
+# 厂商转场**目录**（用户 2026-10-14 提供的《转场 ID》表；华北 / 柔佛两套号 + 是否可用于**非交叠**）。
+#
+# 登记它只为一件事：**让「未登记」与「不适用」不再混为一谈**——转场回落硬切时，能如实说清到底是
+# 「我们没登记」还是「厂商目录里根本没有可用的那一项」。
+# ⚠️ **本表按用户给的文档片段照实录入**：ID 序列在 `1182371 → 1182373` 处有跳号（`1182372` 不在片段里）
+# ⇒ **可能不是全集**（片段可能被截断）。故它只作**参照**，不作「厂商一共就这些」的断言。
+# 我们只可能用到 `nonOverlap=True` 的那批（硬约束：音轨一整条、时间线严格连续，交叠会破坏音画对齐）。
+TRANSITION_CATALOG: dict[str, dict[str, object]] = {
+    "叶片翻转": {"cnNorth": "1182355", "johor": "1109548", "nonOverlap": False},
+    "百叶窗": {"cnNorth": "1182356", "johor": "1109550", "nonOverlap": False},
+    "风吹": {"cnNorth": "1182357", "johor": "1109552", "nonOverlap": False},
+    "交替出场": {"cnNorth": "1182359", "johor": "1109556", "nonOverlap": True},
+    "旋转放大": {"cnNorth": "1182360", "johor": "1109558", "nonOverlap": True},
+    "泛开": {"cnNorth": "1182358", "johor": "1109560", "nonOverlap": True},
+    "风车": {"cnNorth": "1182362", "johor": "1109562", "nonOverlap": False},
+    "多色混合": {"cnNorth": "1182363", "johor": "1109564", "nonOverlap": False},
+    "遮罩转场": {"cnNorth": "1182364", "johor": "1109566", "nonOverlap": False},
+    "六角形": {"cnNorth": "1182365", "johor": "1109568", "nonOverlap": True},
+    "心型打开": {"cnNorth": "1182366", "johor": "1109570", "nonOverlap": False},
+    "故障转换": {"cnNorth": "1182367", "johor": "1109572", "nonOverlap": True},
+    "飞眼": {"cnNorth": "1182368", "johor": "1109574", "nonOverlap": True},
+    "梦幻放大": {"cnNorth": "1182369", "johor": "1109576", "nonOverlap": True},
+    "开门展现": {"cnNorth": "1182370", "johor": "1109578", "nonOverlap": False},
+    "对角擦除": {"cnNorth": "1182371", "johor": "1109580", "nonOverlap": False},
+    "立方转换": {"cnNorth": "1182373", "johor": "1109584", "nonOverlap": True},
+    "透镜变换": {"cnNorth": "1182374", "johor": "1109586", "nonOverlap": True},
+    "晚霞转场": {"cnNorth": "1182375", "johor": "1109588", "nonOverlap": True},
+    "圆形打开": {"cnNorth": "1182376", "johor": "1109590", "nonOverlap": False},
+    "圆形擦开": {"cnNorth": "1182377", "johor": "1109592", "nonOverlap": False},
+    "圆形交替": {"cnNorth": "1182378", "johor": "1109594", "nonOverlap": True},
+    "时钟扫开": {"cnNorth": "1182379", "johor": "1109596", "nonOverlap": False},
 }
 
 
-def resolve_transition(name: str | None) -> dict[str, object] | None:
-    """EDL ``transition``（符号名）→ MediaKit ``extra`` 滤镜的取值；**未登记即返回 None**。"""
+def resolve_transition(name: str | None, region: str = "cn-north") -> dict[str, object] | None:
+    """EDL ``transition``（符号名）→ 该区域的 MediaKit 资源 ID；**未登记即返回 None**。
+
+    ``region`` = ``cn-north``（华北，端点默认所在）| ``johor``（柔佛）——厂商给的是两套号，见 ``TRANSITION_CATALOG``。
+    """
     key = (name or "").strip()
     if not key:
         return None
     entry = TRANSITION_VENDOR.get(key)
-    if not entry or not str(entry.get("id") or "").strip():
+    if not entry:
         return None
-    return entry
+    field = "johor" if region.strip().lower() in ("johor", "ap-southeast") else "cnNorth"
+    resource_id = str(entry.get(field) or "").strip()
+    if not resource_id:
+        return None
+    return {**entry, "id": resource_id}
 
 
-def transition_filters(seg: common.DspEdlSegment) -> list[dict]:
+def transition_filters(seg: common.DspEdlSegment, region: str = "cn-north") -> list[dict]:
     """该段末尾的转场 → ``extra`` 滤镜列表（**未登记 = 空列表 = 硬切**）。"""
-    entry = resolve_transition(seg.transition)
+    entry = resolve_transition(seg.transition, region)
     if not entry:
         return []
     return [{
@@ -149,26 +200,67 @@ def transition_filters(seg: common.DspEdlSegment) -> list[dict]:
     }]
 
 
-def transition_warnings(edl: common.DspEdl) -> list[str]:
-    """未登记 / 非「非交叠」的转场 → 如实的降级说明（``render_compose`` 并入 ``warnings``）。"""
+def transition_warnings(
+    edl: common.DspEdl, clip_shot_ids: set[str] | None = None, region: str = "cn-north",
+) -> list[str]:
+    """未登记 / 非「非交叠」/ **相邻含静图** 的转场 → 如实的降级说明（``render_compose`` 并入 ``warnings``）。
+
+    三种回落各有各的说法（**不混为一谈**）：
+      ① **我们没登记**（符号不在 ``TRANSITION_VENDOR`` 里）；
+      ② **登记了但该区域没号** / **只支持交叠**；
+      ③ **已施加**但相邻元素含**静图**——厂商文档的适用范围是「同轨道**相邻两 Video**」，
+         静图邻接是否生效**未经实测**（登记 B1b ③）。
+    ``clip_shot_ids`` = 真出了视频片段的镜 id（主轨会用 ``video`` 元素的那批），给定它才做 ③ 的判定。
+    """
     warnings: list[str] = []
     for track in edl.tracks:
         if track.kind != "image":
             continue
-        for seg in track.segments:
+        for idx, seg in enumerate(track.segments):
             name = (seg.transition or "").strip()
             if not name:
                 continue
-            entry = TRANSITION_VENDOR.get(name)
-            if not entry:
+            if name not in TRANSITION_VENDOR:
+                # 区分「我们没登记」与「厂商目录里就没有可用于非交叠的那一项」——后者不是我们漏登记
+                overlap_only = sum(1 for row in TRANSITION_CATALOG.values() if not row.get("nonOverlap"))
                 warnings.append(
                     f"转场 {name} 未登记厂商资源 ID，已回落**硬切**（不编造 ID；登记后自动生效）。"
+                    f"（本仓只允许**非交叠**转场，而厂商目录 {len(TRANSITION_CATALOG)} 项里有 "
+                    f"{overlap_only} 项标「不可用于非交叠」——擦除/黑场一类过渡正在其中；"
+                    f"当前已登记可用项：{', '.join(sorted(TRANSITION_VENDOR)) or '无'}）"
                 )
-            elif str(entry.get("mode") or "") != "non-overlap":
+                continue
+            entry = resolve_transition(name, region)
+            if entry is None:
+                warnings.append(
+                    f"转场 {name} 未登记区域 {region!r} 的资源 ID，已回落**硬切**"
+                    "（厂商按区域给两套号，见 `TRANSITION_CATALOG`）。"
+                )
+                continue
+            if str(entry.get("mode") or "") != "non-overlap":
                 warnings.append(
                     f"转场 {name} 只支持交叠模式，与「一整条配音音频严格对齐」冲突，已回落**硬切**。"
                 )
+                continue
+            if clip_shot_ids is not None and _has_still_neighbor(edl, idx, clip_shot_ids):
+                warnings.append(
+                    f"转场 {name} 已施加，但厂商文档的适用范围是「**同轨道相邻两 Video**」——"
+                    "本处相邻元素含**静图**（未出片的镜回落 image），静图邻接是否生效**未经实测**"
+                    "（登记 B1b ③）；若不生效则该处等同硬切。"
+                )
     return warnings
+
+
+
+def _has_still_neighbor(edl: common.DspEdl, idx: int, clip_shot_ids: set[str]) -> bool:
+    """该转场涉及的**两个相邻元素**（本段与下一段）里是否有静图（即非 video 元素）。"""
+    shots = edl.shots
+    for pos in (idx, idx + 1):
+        shot = shots[pos] if pos < len(shots) else None
+        if shot is None or shot.id not in clip_shot_ids:
+            return True
+    return False
+
 
 
 # ── EDL → track[][]（契约 §7.2 逐字段映射）────────────────────────
@@ -184,6 +276,7 @@ def build_tracks(
     subtitle_font_size: int = 48,
     canvas_width: int = 1080,
     canvas_height: int = 1920,
+    transition_region: str = "cn-north",
 ) -> list[list[dict]]:
     """把本仓 EDL 翻成 MediaKit ``track[][]``（索引越大越上层）。
 
@@ -223,7 +316,7 @@ def build_tracks(
                 if not src:
                     continue  # 留空位的镜头：无图可取，如实跳过（timeline 已在 notes 说明）
                 elem = {"type": "image", "source": src, "target_time": span}
-            extra = transition_filters(seg)
+            extra = transition_filters(seg, transition_region)
             if extra:
                 elem["extra"] = extra
             media_elements.append(elem)
