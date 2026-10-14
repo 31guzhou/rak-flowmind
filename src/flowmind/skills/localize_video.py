@@ -73,6 +73,10 @@ class LocalizeVideoInput(BaseModel):
     output_path: str | None = Field(
         default=None, description="输出 mp4 路径；None=输入同目录 <stem>_localized.mp4"
     )
+    watermark_bbox: tuple[float, float, float, float] | None = Field(
+        default=None,
+        description="固定水印区域归一化坐标 (x0,y0,x1,y1)，各坐标范围 0-1",
+    )
     keep_background_audio: bool = Field(default=True, description="原声 -12dB 保留为背景（BGM/环境音不丢）；显式传 False 可输出纯配音")
     tts_backend: str | None = Field(
         default=None,
@@ -102,6 +106,17 @@ class LocalizeVideoInput(BaseModel):
             raise ValueError("video_path 不能为空")
         return v.strip()
 
+    @field_validator("watermark_bbox")
+    @classmethod
+    def _valid_watermark_bbox(cls, v):
+        if v is not None and (
+            any(coord < 0 or coord > 1 for coord in v)
+            or v[2] <= v[0]
+            or v[3] <= v[1]
+        ):
+            raise ValueError("watermark_bbox 必须是 0-1 范围内的非空区域")
+        return v
+
 
 class LocalizeVideoReport(BaseModel):
     """流水线业务载荷。"""
@@ -114,6 +129,7 @@ class LocalizeVideoReport(BaseModel):
     asr_backend: str = "cloud"            # 实际使用的 ASR 后端（local/cloud）
     ocr_backend: str = "cloud"            # 实际使用的 OCR 后端（local/cloud）
     erase_backend: str | None = None      # 实际使用的擦除后端（lama/delogo；增量字段）
+    watermark_removed: bool = False
     # 字幕向量化（增量字段）：True=已写入 Milvus；False=未写入（未配置或失败，
     # 由阶段消息与日志区分）；None=开关关闭
     vectorized: bool | None = None
@@ -228,6 +244,7 @@ def localize_video(inp: LocalizeVideoInput) -> SkillOutput[LocalizeVideoReport]:
             asr_backend=report["asr_backend"],
             ocr_backend=report["ocr_backend"],
             erase_backend=report["erase_backend"],
+            watermark_removed=report["watermark_removed"],
             vectorized=report["vectorized"],
         ),
         reasoning=[chain], confidence=0.9,
@@ -402,19 +419,26 @@ def run_localization_pipeline(args: LocalizeVideoInput, workdir: Path,
                           regions=regions, width=width, height=height)
     out_path = _resolve_out_path(args, src, workdir)
     # 精准擦除：OCR 文本行框逐框外扩（不再合成大横带误伤前景主体）
-    erase_regs = _prep_erase_regions(regions, width, height)
+    subtitle_erase_regs = _prep_erase_regions(regions, width, height)
+    watermark_regions = _watermark_region(args.watermark_bbox, width, height)
+    erase_regs = subtitle_erase_regs + watermark_regions
     src_local = _ensure_local(src, workdir)
     # 擦除后端：auto=LaMa 可用则用（复杂背景无拉丝）否则 delogo；
     # local=强制 LaMa（缺失/失败显式报错，不静默回落）；delogo=旧硬横带
     erase_used = "delogo"
     eff_erase = (args.erase_backend or getattr(cfg, "erase_backend", "auto")).lower()
-    progress_cb("erase", 57.0, f"擦除字幕区（{eff_erase}，{len(erase_regs)} 框）")
+    progress_cb(
+        "erase", 57.0,
+        f"擦除字幕/水印（{eff_erase}，{len(erase_regs)} 框）",
+    )
     if erase_regs and eff_erase in ("auto", "local", "lama"):
         if _inpaint.available():
             with gpu_lane():
                 _inpaint.erase_regions(
-                    src_local, erase_regs,
-                    str(workdir / "inpainted.mp4"), str(workdir))
+                    src_local, subtitle_erase_regs,
+                    str(workdir / "inpainted.mp4"), str(workdir),
+                    solid_regions=watermark_regions,
+                )
             erased_video = _media.burn_subtitles(
                 str(workdir / "inpainted.mp4"),
                 str(workdir / "subbed.mp4"), ass_path)
@@ -531,6 +555,7 @@ def run_localization_pipeline(args: LocalizeVideoInput, workdir: Path,
         "asr_backend": asr_backend,
         "ocr_backend": ocr_backend,
         "erase_backend": erase_used,
+        "watermark_removed": bool(watermark_regions),
         "vectorized": vectorized,
     }
 
@@ -565,7 +590,7 @@ def _select_asr(cfg, speech_key: str) -> tuple[str, object]:
     - cloud  = 强制 dashscope 流式
     - auto   = 本地库可导入即用本地；否则回落云；两端都不可用显式报错
     """
-    chosen = (cfg.asr_backend or "auto").lower()
+    chosen = (getattr(cfg, "asr_backend", None) or "auto").lower()
 
     def _local(p: str, lang: str | None) -> list[dict]:
         return _local_asr.transcribe_local(
@@ -595,7 +620,7 @@ def _select_ocr(cfg, speech_key: str) -> tuple[str, object]:
 
     语义同 _select_asr：local(RapidOCR CPU) / cloud(qwen3.5-ocr) / auto。
     """
-    chosen = (cfg.ocr_backend or "auto").lower()
+    chosen = (getattr(cfg, "ocr_backend", None) or "auto").lower()
 
     def _local(frames: list[str], w: int | None, h: int | None) -> list[dict]:
         return _local_ocr.locate_subtitle_region(frames, frame_width=w, frame_height=h)
@@ -857,6 +882,22 @@ def _prep_erase_regions(regions: list[dict], width: int | None,
             continue  # 退化框（噪声）跳过
         out.append({"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0})
     return out
+
+
+def _watermark_region(
+    bbox: tuple[float, float, float, float] | None,
+    width: int,
+    height: int,
+) -> list[dict]:
+    """Convert a normalized fixed watermark box to a clipped pixel rectangle."""
+    if bbox is None:
+        return []
+    x0, y0, x1, y1 = bbox
+    left, top = round(x0 * width), round(y0 * height)
+    right, bottom = round(x1 * width), round(y1 * height)
+    if right <= left or bottom <= top:
+        raise ValueError("watermark_bbox must define a non-empty region")
+    return [{"x": left, "y": top, "w": right - left, "h": bottom - top}]
 
 
 def _replace_audio(video_path: str, audio_wav: str, out_path: str) -> str:
