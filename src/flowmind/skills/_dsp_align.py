@@ -426,7 +426,6 @@ class CutShot:
     """收口所需的镜头视图（比 ``AlignShot`` 多带重建终版镜头所需的字段）。"""
     id: str
     copy: str
-    need_kind: str = ""
     clip_keys: tuple[str, ...] = ()
     """该镜的**运镜方案**（ADR-076「运镜导演」看图产出；``None`` = 摄影机固定）。
     **并镜取主导镜的方案、拆镜两半共用**（同一画面意图），与 ``visual_prompt`` 同款语义。
@@ -522,7 +521,7 @@ def consolidate_shots(
     for gi, group in enumerate(groups):
         at = spans[group[0]].atMs
         dur = sum(spans[j].durationMs for j in group)
-        # 主导成员 = 实测最长的那一镜（决定画面意图、运镜与类目；并镜后仍要有个明确的表达）
+        # 主导成员 = 实测最长的那一镜（决定画面意图与运镜；并镜后仍要有个明确的表达）
         dominant = max(group, key=lambda j: spans[j].durationMs)
         copy = "".join(shots[j].copy for j in group)
         # 画面提示词（ADR-073）：并镜 = 各镜画面描述**按行拼接**（跳过空串）；拆镜时两半共用 base，自然继承
@@ -538,7 +537,6 @@ def consolidate_shots(
             id="",  # 收尾统一重排
             copy=copy,
             visual_prompt=visual_prompt,
-            need_kind=shots[dominant].need_kind,
             clip_keys=tuple(clip_keys),
             motion=shots[dominant].motion,  # ADR-076：并镜取主导镜的运镜方案（拆镜两半共用）
             transition_after=shots[group[-1]].transition_after,  # 转场只属于**整镜末尾**

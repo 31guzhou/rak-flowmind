@@ -21,9 +21,9 @@
 来源 = 下发镜头的 ``transitionAfter``；**但被拆开的镜，其内部那刀按硬切**（用户设的转场是给整镜末尾的）。
 厂商资源 ID 未登记时由 ``render_compose`` 如实回落硬切并告警——本步只忠实记录符号值。
 
-**终版镜头自带文案与运镜**：收口会并/拆镜并重排 id（``s1..sK``），故每镜的 ``copy`` / ``needKind`` /
-``motion`` 一并落进 ``edl.shots[]``——下游（I2V 提示词与运镜等）**一律读 EDL**，不再回查 ``inp.shots``
-（否则并/拆后必然错配）。
+**终版镜头自带文案与运镜**：收口会并/拆镜并重排 id（``s1..sK``），故每镜的 ``copy`` /
+``visualPrompt`` / ``motion`` 一并落进 ``edl.shots[]``——下游（I2V 提示词与运镜等）**一律读 EDL**，
+不再回查 ``inp.shots``（否则并/拆后必然错配）。
 
 **运镜（ADR-076）**：**不再往 segment 写 ``effect``**。运镜是**逐镜结构化方案**（前端「运镜导演」
 **看图**产出，含 type/intensity/direction/target/reason/正负提示词），**原样搬运**到
@@ -32,9 +32,12 @@
 
 选图口径（契约 §3.2，**不臆造素材**）：
 1. 镜头给了**指名的图**（ADR-077：`shots[].image.assetKey`）→ 用它；
-2. 否则从 ``materials`` 里按 ``needKind == category`` 选图，**优先取与上一镜不同的一张**
-   （否则拆镜拆出的两半复用同一张图，画面观感等同没切）；
-3. 选不到 → 该镜**留空位**并在 ``notes`` 里如实说明。
+2. 没给 → 该镜**留空位**并在 ``notes`` 里如实说明。
+
+**2026-10-15：删掉「按类目从素材池选图」这一档**（cross-dashboard ADR-088 的跨仓部分）。
+旧口径的第 2 档是 ``needKind == category``（两字段都来自「素材类目」那套已退役的架构），
+删掉后本技能**只认指名图**——上游（智能选图 / 逐镜手工选片）本来就已逐镜给出 ``assetKey``，
+这一档在报文里长期是**恒空**（两字段都空 ⇒ 旧代码会「全等命中」，等于没有筛选）。
 
 **四块（ADR-077）**：画面提示词取 `i2v.authorPrompt`、指名图取 `image.assetKey`、运镜方案取
 `i2v.motion`（旧扁平字段由 `DspShot._lift_legacy` 提升，故旧 run 的 spec 原样重跑仍能跑）。
@@ -58,7 +61,7 @@ from flowmind.skills import _dsp_common as common
 from flowmind.skills import _dsp_storage as storage
 from flowmind.skills._dsp_common import DspBaseInput
 
-_VERSION = "0.3.0"
+_VERSION = "0.4.0"
 
 DurationSource = Literal["measured", "estimated"]
 
@@ -77,13 +80,11 @@ class TimelineBuildData(BaseModel):
 
 
 def _select_image(
-    shot_id: str, clip_keys: tuple[str, ...], need_kind: str,
-    materials: list[common.DspMaterial], pool_keys: set[str], avoid: str = "",
+    shot_id: str, clip_keys: tuple[str, ...], pool_keys: set[str], avoid: str = "",
 ) -> tuple[str, list[str]]:
-    """为单镜选图，返回 ``(sourceKey, notes)``；选不到 = 空串 + 说明。
+    """为单镜选图，返回 ``(sourceKey, notes)``；没指名 = 空串 + 说明。
 
-    ``avoid`` = 上一镜已用的 key：同类目有多张时**优先换一张**（拆镜拆出的两半若复用同一张图，
-    画面观感等同没切）；只有一张时如实说明复用。
+    ``avoid`` = 上一镜已用的 key（**仅用于如实提示**：指名图与上一镜相同时画面观感等同没切）。
     """
     notes: list[str] = []
     if clip_keys:
@@ -94,19 +95,7 @@ def _select_image(
             notes.append(f"镜头 {shot_id} 指名的图与上一镜相同（画面观感等同不切）")
         return chosen, notes
 
-    if need_kind:
-        same = [m.key for m in materials if m.category == need_kind]
-        if same:
-            fresh = [k for k in same if k != avoid]
-            if fresh:
-                return fresh[0], notes
-            if avoid:
-                notes.append(f"镜头 {shot_id} 的「{need_kind}」只有同一张图，与上一镜复用（观感等同不切）")
-            return same[0], notes
-        notes.append(f"镜头 {shot_id} 未匹配到「{need_kind}」图片，已留空位")
-        return "", notes
-
-    notes.append(f"镜头 {shot_id} 未声明图片类目（needKind）且未指名图，已留空位")
+    notes.append(f"镜头 {shot_id} 未指名图，已留空位（选图由上游逐镜给出）")
     return "", notes
 
 
@@ -166,7 +155,6 @@ def _cut_shots(inp: TimelineBuildInput) -> list[align.CutShot]:
             id=s.id,
             copy=s.copy_text,
             visual_prompt=s.author_prompt,
-            need_kind=s.needKind,
             clip_keys=(s.asset_key,) if s.asset_key else (),
             motion=s.motion_plan,  # ADR-076：运镜方案原样进收口（并镜取主导、拆镜共用）
             transition_after=(s.transitionAfter or None),
@@ -271,7 +259,7 @@ def timeline_build(inp: TimelineBuildInput) -> SkillOutput[TimelineBuildData]:
     kept_transitions = 0
     for idx, (shot, span) in enumerate(zip(cut.shots, cut.spans, strict=True)):
         source_key, shot_notes = _select_image(
-            shot.id, shot.clip_keys, shot.need_kind, materials, pool_keys, avoid=used_prev)
+            shot.id, shot.clip_keys, pool_keys, avoid=used_prev)
         notes.extend(shot_notes)
         used_prev = source_key or used_prev
 
@@ -301,7 +289,6 @@ def timeline_build(inp: TimelineBuildInput) -> SkillOutput[TimelineBuildData]:
             imageSourceKey=source_key,
             copy=shot.copy,
             visualPrompt=shot.visual_prompt,
-            needKind=shot.need_kind,
             motion=shot.motion,  # ADR-076：I2V 从这里读运镜（不回查 inp.shots——并/拆会重排 id）
         ))
 
@@ -361,7 +348,7 @@ def timeline_build(inp: TimelineBuildInput) -> SkillOutput[TimelineBuildData]:
                     "无配音真值，按 shots[].durationMs 累加（已如实标注）；"
                 )
                 + f"收口（并 {cut.merged} / 拆 {cut.split}，切点都在实测 token 边界上）→ {len(cut.shots)} 镜；"
-                + f"选图顺序 clipKeys → needKind==category（相邻镜优先换图）→ 留空位；素材池 {len(materials)} 张。"
+                + f"选图只看镜头指名的图（clipKeys → image.assetKey），没指名即留空位；素材池 {len(materials)} 张。"
             ),
             risk_note=(
                 "时间线一经锁定不再变动，字幕/渲染均读它；"

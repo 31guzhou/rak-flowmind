@@ -33,7 +33,8 @@ def _ctx(**over) -> dict:
         "cachePrefix": "dsp/scratch/t1", "outputPrefix": "dsp/output/t1",
         "runId": "run-demo-5", "stepId": "cover", "idempotencyKey": "run-demo-5:cover",
         "shots": [{"id": "s1", "durationMs": 3000, "copy": "开门的瞬间"}],
-        "materials": [{"kind": "image", "key": "dsp/scratch/t1/门店/门头1.jpg", "category": "门头"}],
+        # 素材池条目（2026-10-15 起**没有** category 字段——类目维度已退役，身份改判为来源）
+        "materials": [{"kind": "image", "key": "dsp/scratch/t1/门店/门头1.jpg"}],
         "deps": {"timeline": {"edl": {"version": 1, "totalMs": 9000, "shots": [
             {"id": "s1", "atMs": 0, "durationMs": 3000,
              "imageSourceKey": "dsp/scratch/t1/门店/门头1.jpg"},

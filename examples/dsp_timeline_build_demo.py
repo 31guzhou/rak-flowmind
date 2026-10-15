@@ -14,6 +14,9 @@
    句内下沉到词边界**（8b 专测后者）；被拆开的**内部**那刀按硬切，用户设的转场保留在**整镜末尾**
 9. **转场**：非拆分边界上的符号值原样落 EDL（厂商资源 ID 未登记时由 render 侧如实回落硬切）
 10. error：镜头时长非法（ge=1）→ VALIDATION
+11. ADR-077 四块：旧扁平字段提升（老 run 的 spec 原样重跑仍能跑）
+12. **类目退役**（2026-10-15）：旧报文的 `needKind` / `materials[].category` 被忽略，
+    选图**只看指名图**（`clipKeys` / `image.assetKey`），没指名即留空位
 
 mock 方式：替换 ``_dsp_storage.put_text`` 为内存实现（本文件内），不需要对象存储。
 """
@@ -56,17 +59,19 @@ def _install_storage() -> None:
 
 
 def _shots() -> list[dict]:
-    # 注：**不再有 weight 字段**（ADR-070：比例兜底的权重改由 `timeline` 从文案字数自算）。
-    # 旧 spec 快照里若还带 weight，pydantic 会忽略（extra 默认 ignore），故旧快照仍可跑。
+    # 注：**不再有 weight 字段**（ADR-070：比例兜底的权重改由 `timeline` 从文案字数自算），
+    # **也不再需要 needKind**（2026-10-15 类目退役）：选图只看镜头指名的图（`clipKeys` /
+    # `image.assetKey`），没指名就留空位。旧 spec 快照里若还带 weight / needKind，pydantic
+    # 会忽略（extra 默认 ignore），故旧快照仍可跑——见第 12 节。
     return [
-        {"id": "s1", "label": "门头开场", "needKind": "门头", "durationMs": 3000,
+        {"id": "s1", "label": "门头开场", "durationMs": 3000,
          "copy": "开门的瞬间", "clipKeys": ["dsp/scratch/t1/门店/门头1.jpg"],
          "motion": {"type": "push_in", "intensity": "subtle", "direction": "toward_subject",
                     "target": "店门", "reason": "门头留白充足，轻微推近强化第一眼",
                     "positive": "", "negative": ""}},
-        {"id": "s2", "label": "产品特写", "needKind": "产品", "durationMs": 4000,
+        {"id": "s2", "label": "产品特写", "durationMs": 4000,
          "copy": "保温12小时"},
-        {"id": "s3", "label": "人物", "needKind": "人物", "durationMs": 2000,
+        {"id": "s3", "label": "人物", "durationMs": 2000,
          "copy": "上班族的早晨"},
     ]
 
@@ -96,9 +101,9 @@ def _ctx(**over) -> dict:
         "runId": "run-demo-1", "stepId": "timeline", "idempotencyKey": "run-demo-1:timeline",
         "shots": _shots(),
         "materials": [
-            {"kind": "image", "key": "dsp/scratch/t1/门店/门头1.jpg", "category": "门头",
+            {"kind": "image", "key": "dsp/scratch/t1/门店/门头1.jpg",
              "width": 1080, "height": 1920},
-            {"kind": "image", "key": "dsp/scratch/t1/产品/杯1.jpg", "category": "产品"},
+            {"kind": "image", "key": "dsp/scratch/t1/产品/杯1.jpg"},
         ],
     }
     base.update(over)
@@ -122,7 +127,7 @@ def main() -> None:
     for path, names in field_names("timeline_build").items():
         print(f"  {path}: {names}")
 
-    section("1) 实测路径：3 镜逐句对上（指名 / 类目命中 / 无图留空位）")
+    section("1) 实测路径：3 镜逐句对上（指名选到图 / 未指名留空位）")
     _install_storage()
     _WRITTEN.clear()
     r = invoke("timeline_build", _ctx(deps={"tts": _seg([
@@ -144,7 +149,9 @@ def main() -> None:
           "第一镜的运镜方案原样落进 edl.shots[].motion")
     check(d.edl.shots[1].motion is None and d.edl.shots[2].motion is None,
           "未给方案的镜头 motion 为 None（= 摄影机固定）")
-    check(segs[2].sourceKey == "", "第三镜无匹配图 → 留空位")
+    check(segs[0].sourceKey == "dsp/scratch/t1/门店/门头1.jpg", "第一镜指名了图 → 用它")
+    check(segs[1].sourceKey == "" and segs[2].sourceKey == "",
+          "未指名的镜**不会**再从素材池按类目挑（类目已退役）→ 留空位")
     check(any("留空位" in n for n in d.notes), "留空位须在 notes 里如实说明")
     check(not any("推断" in n or "静默常量" in n for n in d.notes), "逐句都对上 → 不应有推断/静默告警")
     check(d.edlKey in _WRITTEN, "EDL 快照须落对象存储")
@@ -227,9 +234,9 @@ def main() -> None:
 
     section("8) 收口 · 拆镜 + 转场（ADR-070）：> 6s 在内部句边界一分为二；内部那刀按硬切")
     shots_split = [
-        {"id": "s1", "label": "门头+产品", "needKind": "门头", "durationMs": 7000,
+        {"id": "s1", "label": "门头+产品", "durationMs": 7000,
          "copy": "开门的瞬间保温12小时", "transitionAfter": "dissolve"},
-        {"id": "s2", "label": "人物", "needKind": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
+        {"id": "s2", "label": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
     ]
     r = invoke("timeline_build", _ctx(shots=shots_split, deps={"tts": _seg([
         (0, 3000, "开门的瞬间"),
@@ -251,14 +258,14 @@ def main() -> None:
           "转场须如实说明「厂商资源 ID 未登记即回落硬切」")
     check(d.edl.shots[0].copy == "开门的瞬间保温12小时" and d.edl.shots[1].copy == "开门的瞬间保温12小时",
           "拆开的两半**共用该镜文案**（它们讲的是同一段话）")
-    check(any("复用" in n for n in d.notes),
-          "拆出的两半同类目只有一张图 → 如实说明复用（画面观感等同不切）")
+    check(all(s.sourceKey == "" for s in segs),
+          "没指名图的镜（含拆出的两半）一律留空位——类目退役后**不再**有「按类目挑图」这一档")
 
     section("8b) 收口 · 拆镜**下沉到词边界**：整镜就是一整句且超长（句内无句边界）→ 切词")
     shots_word = [
-        {"id": "s1", "label": "长句一镜", "needKind": "门头", "durationMs": 8000,
+        {"id": "s1", "label": "长句一镜", "durationMs": 8000,
          "copy": "开门的瞬间保温十二小时", "visualPrompt": "长句一镜的画面描述"},
-        {"id": "s2", "label": "人物", "needKind": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
+        {"id": "s2", "label": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
     ]
     r = invoke("timeline_build", _ctx(shots=shots_word, deps={"tts": _seg([
         (0, 8000, "开门的瞬间保温十二小时", [
@@ -282,11 +289,11 @@ def main() -> None:
 
     section("9b) 画面提示词（ADR-073）：并镜按行拼接、随 EDL 透出给 image_to_video")
     shots_vp = [
-        {"id": "s1", "label": "门头", "needKind": "门头", "durationMs": 1000,
+        {"id": "s1", "label": "门头", "durationMs": 1000,
          "copy": "开门", "visualPrompt": "A 画面：门头晨光"},
-        {"id": "s2", "label": "产品", "needKind": "产品", "durationMs": 1000,
+        {"id": "s2", "label": "产品", "durationMs": 1000,
          "copy": "保温", "visualPrompt": "B 画面：杯身特写"},
-        {"id": "s3", "label": "人物", "needKind": "人物", "durationMs": 2000,
+        {"id": "s3", "label": "人物", "durationMs": 2000,
          "copy": "上班族", "visualPrompt": "C 画面：通勤人流"},
     ]
     r = invoke("timeline_build", _ctx(shots=shots_vp, deps={"tts": _seg([
@@ -302,9 +309,9 @@ def main() -> None:
 
     section("9) 转场：非拆分边界上的符号值原样落 EDL（厂商 ID 未登记 ⇒ render 侧回落硬切）")
     shots_tr = [
-        {"id": "s1", "label": "门头", "needKind": "门头", "durationMs": 3000,
+        {"id": "s1", "label": "门头", "durationMs": 3000,
          "copy": "开门的瞬间", "transitionAfter": "fade-black"},
-        {"id": "s2", "label": "人物", "needKind": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
+        {"id": "s2", "label": "人物", "durationMs": 2000, "copy": "上班族的早晨"},
     ]
     r = invoke("timeline_build", _ctx(shots=shots_tr, deps={"tts": _seg([
         (0, 3000, "开门的瞬间"),
@@ -354,6 +361,31 @@ def main() -> None:
     check(r2.ok, "显式四块的入参应 ok")
     check(r2.data.edl.shots[0].imageSourceKey == "k1",
           "显式 image.assetKey 照常被 timeline 选图（与旧 clipKeys 口径等价）")
+
+    section("12) 类目退役（2026-10-15）：旧报文的 needKind / category 被忽略，不再选图")
+    legacy = _ctx(
+        shots=[
+            {"id": "s1", "label": "产品特写", "needKind": "产品", "durationMs": 3000,
+             "copy": "保温12小时"},
+            {"id": "s2", "label": "门头", "durationMs": 2000, "copy": "开门的瞬间",
+             "clipKeys": ["dsp/scratch/t1/门店/门头1.jpg"]},
+        ],
+        materials=[
+            {"kind": "image", "key": "dsp/scratch/t1/产品/杯1.jpg", "category": "产品"},
+            {"kind": "image", "key": "dsp/scratch/t1/门店/门头1.jpg", "category": "门头"},
+        ],
+    )
+    r = invoke("timeline_build", legacy)
+    check(r.ok, "旧报文（带类目字段）**必须照常跑通**——pydantic 默认忽略多余键")
+    d = r.data
+    _dump(d)
+    check(d.edl.tracks[0].segments[0].sourceKey == "",
+          "旧 needKind 不再从素材池挑图（池里明明有「产品」那张）→ 留空位")
+    check(d.edl.tracks[0].segments[1].sourceKey == "dsp/scratch/t1/门店/门头1.jpg",
+          "指名的图照常选上（选图只看指名）")
+    check(not hasattr(d.edl.shots[0], "needKind"), "EDL 镜头不再记类目（字段已从模型删除）")
+    check(not any(k.startswith("shots") and "needKind" in v for k, v in field_names("timeline_build").items()),
+          "inp 的 shots[] 里已没有 needKind（契约字段删除，非仅置空）")
 
     print("\n✅ dsp_timeline_build_demo 全部通过")
 

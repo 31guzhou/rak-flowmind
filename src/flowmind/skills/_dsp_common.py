@@ -234,8 +234,6 @@ class DspShot(BaseModel):
 
     id: str
     label: str = ""
-    needKind: str = Field(
-        default="", description="该镜需要的图片类目——**ADR-077 起退化为可选提示**（选图以画面为准）")
     durationMs: int = Field(
         ..., ge=1,
         description="镜头**估算**时长（ms，前端按文案字数算）——ADR-069：仅「无配音」时的兜底；"
@@ -297,10 +295,14 @@ class DspShot(BaseModel):
 
 
 class DspMaterial(BaseModel):
-    """素材池条目（**图片**：jpg/jpeg/png/webp）。"""
+    """素材池条目（**图片**：jpg/jpeg/png/webp）。
+
+    ⚠️ **没有「类目」字段**（2026-10-15 删除）：素材身份已改判为**来源**（`asset_origin`，记在
+    前端侧，见 cross-dashboard ADR-088），类目维度**整块退役**——旧报文里的 `category` 键由
+    pydantic 默认忽略（`extra="ignore"`），故**老快照原样重跑仍能跑**，不会因多一个键而报错。
+    """
     kind: str = "image"
     key: str
-    category: str = ""
     width: int | None = None
     height: int | None = None
     durationMs: int = 0
@@ -362,7 +364,7 @@ class DspEdlShot(BaseModel):
     """EDL 里的**终版镜头**（渲染侧按它定位每镜）。
 
     ADR-070：镜头在 ``timeline`` 里经**收口**（并/拆）后会重排 id（``s1..sK``），故终版镜头的
-    ``id`` 与下发的 ``shot.id`` **不一定一一对应**——因此把**该镜的文案**（与类目）一并落进 EDL，
+    ``id`` 与下发的 ``shot.id`` **不一定一一对应**——因此把**该镜的文案与画面提示词**一并落进 EDL，
     下游（I2V 的提示词、封面、诊断）一律读这里，**不再回查 ``inp.shots``**（否则并/拆后必然错配）。
     """
     id: str
@@ -374,7 +376,6 @@ class DspEdlShot(BaseModel):
         default="",
         description="**该终版镜头**的**画面提示词**（ADR-073；并镜=按行拼接、拆镜=两半共用）。"
                     "`image_to_video` 优先用它出 prompt，缺则回落 `copy` 并如实告警")
-    needKind: str = Field(default="", description="该终版镜头需要的图片类目（并镜取其一，仅供诊断）")
     motion: DspShotMotion | None = Field(
         default=None,
         description="**该终版镜头**的运镜方案（ADR-076；并镜取**主导镜**、拆镜两半共用）。"
