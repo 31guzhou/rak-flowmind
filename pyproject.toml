@@ -31,6 +31,7 @@ dev = [
 [project.scripts]
 mcp-base-gpu = "flowmind.server_http:main"   # 单端口唯一入口（MCP + 任务 REST）
 flowmind-mcp = "flowmind.server:main"        # stdio 调试入口
+rapidocr-sidecar = "flowmind.ocr_sidecar:main"  # 本机 OCR 侧车（cross-dashboard 文字核查直连，ADR-097）
 
 [build-system]
 requires = ["hatchling"]
