@@ -18,10 +18,22 @@
 
 **启动**（本机 dev，手动起）::
 
+    # ① 容器（**默认这条路**，cross-dashboard ADR-100）：引擎/模型/依赖钉在镜像里，与开发机的 Python 无关
+    docker compose -f deploy/ocr-sidecar/docker-compose.yml up -d      # 只发布到宿主 127.0.0.1:8765
+    docker compose -f deploy/ocr-sidecar/docker-compose.yml down       # 停（cross-dashboard 侧有 `ocr:serve` / `ocr:docker:down` 包着）
+    # ② 原生（本机装好依赖时；也是与容器对账的基准）
     PYTHONPATH=src python -m flowmind.ocr_sidecar --port 8123
     # 装好包装后与 mcp-base-gpu 同形：rapidocr-sidecar --port 8123
 
-**接口**（只监听 127.0.0.1，无凭据；请求体**是原始图片字节**，不是 base64/multipart）::
+**两条路产出同一份结果**（ADR-100 实测对账：同一批图片字节分别打两边，文字 / 四点框 / 置信度三样全同）
+——容器只是把「装没装对 Python 依赖」从每台开发机各答一遍的题，变成一份可复现的字节。⚠️ 镜像里钉死版本
+**不是为了稳**：`engine_info()` 把档位当**证据**上报（`PP-OCRv6/small`），换版本 = 换口径 ⇒
+历史留档与新批次不可比（钉的是 `rapidocr==3.10.0` + `onnxruntime==1.31.0`；模型随 wheel 进镜像）。
+
+**接口**（默认只监听 127.0.0.1，无凭据；请求体**是原始图片字节**，不是 base64/multipart）::
+
+  ⚠️ **容器里要监听 0.0.0.0**（`--host 0.0.0.0`）：监听回环的话宿主根本连不进来。**边界由端口映射给**
+  （compose 只发布到宿主的 `127.0.0.1:8765`），**不是**由容器里的 bind 地址给——两件事别混。
 
     GET  /health → {"ok":true,"engine":...,"model":...,"text_score":0.5,...}
     POST /ocr    ← body = 图片字节（Content-Type: image/*）
