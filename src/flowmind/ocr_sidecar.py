@@ -20,10 +20,13 @@
 
     # ① 容器（**默认这条路**，cross-dashboard ADR-100）：引擎/模型/依赖钉在镜像里，与开发机的 Python 无关
     docker compose -f deploy/ocr-sidecar/docker-compose.yml up -d      # 只发布到宿主 127.0.0.1:8765
-    docker compose -f deploy/ocr-sidecar/docker-compose.yml down       # 停（cross-dashboard 侧有 `ocr:serve` / `ocr:docker:down` 包着）
+    docker compose -f deploy/ocr-sidecar/docker-compose.yml down       # 停
+    #   （本仓包成了 python scripts/ocr_sidecar_dev.py（--status / --down，先探活、不重复起）；cross-dashboard 侧是 `bun run ocr:serve`）
     # ② 原生（本机装好依赖时；也是与容器对账的基准）
     PYTHONPATH=src python -m flowmind.ocr_sidecar --port 8123
     # 装好包装后与 mcp-base-gpu 同形：rapidocr-sidecar --port 8123
+    #   ⚠️ 这条路吃**本机 env** 的 rapidocr + onnxruntime（后者必须显式装：rapidocr 不拉它，
+    #      缺了是**引擎初始化才炸**——`available()` 只探 import，探不到这一层）。真源见 environment.yml。
 
 **两条路产出同一份结果**（ADR-100 实测对账：同一批图片字节分别打两边，文字 / 四点框 / 置信度三样全同）
 ——容器只是把「装没装对 Python 依赖」从每台开发机各答一遍的题，变成一份可复现的字节。⚠️ 镜像里钉死版本

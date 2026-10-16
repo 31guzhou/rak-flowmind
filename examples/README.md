@@ -49,6 +49,23 @@ ffmpeg 的解析与生产**同一套**：`_media` 先看 `.env` 的 `FLOWMIND_ME
 ffmpeg 即自行跳过（exit 0）**——故**不**进「一键全跑 demo」回归底线；它是**按需**复核，把
 「裁切/抽帧机制是否真按设计工作」从口头断言变成可复跑的产物。
 
+## OCR 侧车自检（按需，不进回归底线）
+
+[`ocr_sidecar_realcheck.py`](./ocr_sidecar_realcheck.py) 是 `flowmind.ocr_sidecar`（cross-dashboard
+文字核查的本机侧车，`ADR-097` 后端半）的自检：真起侧车 → `POST /ocr` → 断言**逐行文字 / 四点框 /
+置信度**三段式与 `/health` 字段形状，外加几条**不许把失败冒充成「读过了但没字」**的负向哨兵
+（坏字节 ⇒ 502、非图片 Content-Type ⇒ 415、空白图 ⇒ 0 行——**0 行是合法答案，不是错误**）。
+它要求解释器里真有 `rapidocr` 引擎（`environment.yml` 自 2026-10-16 修漂移后钉的正是新包
+`rapidocr>=3.10`），缺引擎即 `check(ocr_lines.available())` **当场失败**；装好引擎后约 10 秒跑完。
+
+```bash
+PYTHONPATH=$PWD/src python examples/ocr_sidecar_realcheck.py
+```
+
+⚠️ 它起的是**进程内**侧车（`port=0`，系统随机分配），与 `deploy/ocr-sidecar/` 那个容器**无关**
+——容器那条路由 `python scripts/ocr_sidecar_dev.py` 起停（见仓库根 README「OCR 侧车」段）；
+它验的也正是**原生那条路**，即与容器对账时的基准。
+
 ## 🚀 Agent 开箱即用：`discover()`
 
 每个 demo 第一步都跑 `discover()` / `field_names()`，让 Agent 自动发现技能

@@ -28,11 +28,15 @@ conda run -n flowmind ruff check src                      # lint（必须通过�
 for f in examples/*_demo.py; do PYTHONPATH=$PWD/src conda run -n flowmind python "$f"; done  # demo 冒烟（本仓库无单测）
 conda run -n flowmind mcp-base-gpu                        # 单端口入口（MCP + 任务 REST，默认 8002）
 conda run -n flowmind flowmind-mcp                        # stdio 调试入口
+python scripts/ocr_sidecar_dev.py --status                # 本机 OCR 侧车（容器）：在不在跑 / 引擎是什么；可选层，不挡启动
 ```
 
 **Python 3.12**（conda env `flowmind`）。**依赖真源 = `environment.yml`**；
 `pyproject.toml` 只保留包元数据 / entry points / ruff 配置。
-**不用 Makefile / Docker / pytest**（tests/ 已删除，验证靠 demo + 真实 invoke）。
+**不用 Makefile / pytest**（tests/ 已删除，验证靠 demo + 真实 invoke）；**Docker 只有一处**：
+`deploy/ocr-sidecar/`（本机 OCR 侧车容器，cross-dashboard ADR-100 的第三层）——它与本服务**互不依赖**：
+容器没起时主服务照常启动，消费方如实记 `not_run`。起停看：`python scripts/ocr_sidecar_dev.py`
+（`--status` / `--down`；**不带** `PYTHONPATH=src`——它只编排 docker，不 import `flowmind`）。
 worktree 中验证一律 `PYTHONPATH=<worktree>/src conda run -n flowmind ...`。
 
 ## 本地模型（GPU 化，2026-09）

@@ -39,6 +39,7 @@
    `GET /api/v1/manifest/<skill_id>` 查询——**不要猜字段、不要读源码**。
 
 架构细节与不变量见 `CLAUDE.md`；开发工作流见 `AGENTS.md`。
+环境分三层（主应用 / OCR 侧车容器 / 按可用性调用），侧车是**可选层、不挡启动**，见下文「OCR 侧车」段。
 
 ---
 
@@ -215,6 +216,36 @@ Milvus collection `localize_segments`（HNSW + COSINE）。`localize_search`
 未配置的基础设施按语义降级（MQTT → 纯落库；Milvus/嵌入 → 向量化显式禁用，
 流水线尾部静默跳过、`localize_search` 显式报错）；PG 是任务引擎硬依赖，
 缺失显式报错。MQTT 认证：`FLOWMIND_MQTT_USERNAME/PASSWORD`（空 = 匿名）。
+
+## OCR 侧车（本机 dev 的第三层 · 容器 · **不挡启动**）
+
+dsp「生图质检 · 文字核查」要一台**独立于生图模型**的 OCR 引擎，它跑在本机容器里，**不属于本服务**：
+本服务不 import 它、不依赖它、也不因它没起而拒绝启动——`src/flowmind/ocr_sidecar.py` **不是** `@skill`，
+不进 `skills/__init__.py` 的 `FAMILIES`，也不碰 `server*.py`（故本服务不必为它拉起 15 个技能模块的依赖）。
+
+三层边界（决策记录在 cross-dashboard `ADR.md#ADR-100`；这条通道本身是 `#ADR-097`）：
+① 主应用只依赖自己的运行时（`environment.yml`）；② 侧车跑自己的容器（`deploy/ocr-sidecar/`，
+只发布到宿主 `127.0.0.1`）；③ **侧车可用才跑 OCR，不可用 ⇒ 消费方如实记 `not_run`（不假报通过，也不挡启动）**。
+
+```bash
+python scripts/ocr_sidecar_dev.py            # 起（先探活：已在跑就如实说，绝不重复起第二个）
+python scripts/ocr_sidecar_dev.py --status   # 看：在跑 ⇒ 报引擎/模型；没跑 ⇒ 如实说没跑 + 为什么
+python scripts/ocr_sidecar_dev.py --down     # 停
+```
+
+- **端口只有一处真源** `OCR_HOST_PORT`（默认 `8765`，与 compose 同一个变量）。⚠️ `docker compose`
+  只读**项目目录**（compose 文件所在的 `deploy/ocr-sidecar/`）的 `.env`，**不读仓库根的 `.env`**
+  ⇒ 脚本把解析出的端口**显式传进 compose**，两处不会各写一个数。
+- **真正连它的地址不在本仓**：cross-dashboard `.env` 的 `AI_OCR_API_URL`（默认 `http://127.0.0.1:8765`）。
+  两边对不上 ⇒ 那边连不上 ⇒ 那一项如实记没跑成——**不会有人替你猜**。
+- **容器 ≠ 原生**：容器那条路是默认；`rapidocr-sidecar --port 8123` /
+  `PYTHONPATH=src python -m flowmind.ocr_sidecar` 是原生那条路，留着当**对账基准**
+  （2026-10-16 实测：同一张图两条路逐行文字 / 四点框 / 置信度三样全同）。它吃**本机 env** 的
+  `rapidocr` + `onnxruntime`（后者必须显式装——rapidocr 不拉它；缺了是**引擎初始化才炸**，
+  `available()` 那个探针探不到）。
+- ⚠️ **别顺手清依赖**：`environment.yml` 里的 `rapidocr` 服务的是**字幕条定位**
+  （`skills/_local_ocr.py`，`localize_video` 的 `ocr_backend=local/auto`），与这条侧车是两条路
+  ——**它不是为了侧车装的**。
 
 ## MCP 联邦网关（Go go-kernel）
 

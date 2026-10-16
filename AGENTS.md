@@ -27,6 +27,8 @@ done                                              # 跑 18 个 demo 冒烟
 > 单端口 8002 双通道（`/mcp` 轻技能 + `/api/v1/tasks` 长任务）。缺省加载两族共 15 个工具
 > —— **localize 族 7 个**（视频本地化 GPU 流水线）+ **dsp 族 8 个**（抖音成片，算力全下沉云厂商）。
 > **无单测 / 无 Makefile / 无 pytest**——验证靠 `examples/*_demo.py` 冒烟 + 真实调用。
+> **Docker 只有一处**：`deploy/ocr-sidecar/`（本机 OCR 侧车容器，**可选层、不挡启动**，cross-dashboard
+> ADR-100）；起停看：`python scripts/ocr_sidecar_dev.py`（`--status` / `--down`）。
 > GPU（P104-100，Pascal 6.1）与基础设施约定见 `CLAUDE.md`「本地模型」「架构」段。
 > worktree 中验证一律 `PYTHONPATH=<worktree>/src conda run -n flowmind ...`。
 
@@ -58,6 +60,8 @@ src/flowmind/
     ├── content_hot_boards.py  # 未入族占位（helper 缺失，见 __init__ 注释）
     └── _*.py          # 18 个 helper（_cloud_asr/_local_asr/_dsp_align/_dsp_mediakit/_bge_embed…）
 examples/              # 18 个 demo（冒烟验证的唯一手段，本仓库无单测）
+scripts/               # 开发工具（非包内）：check_dsp_env.py 环境自检、ocr_sidecar_dev.py 侧车起停看
+deploy/ocr-sidecar/    # OCR 侧车镜像 + compose（本仓唯一的 Docker 落点）——可选层，不挡启动
 docs/                  # 设计文档
 ```
 

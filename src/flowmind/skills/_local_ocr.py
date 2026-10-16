@@ -9,7 +9,7 @@
 多帧聚合（尺寸/底部先验 + 水平/垂直聚类 + padding）复用 _cloud_ocr
 的 _aggregate_regions，保证两条后端行为一致。
 
-lazy import：rapidocr_onnxruntime 未安装 → OCRError(category="environment")。
+lazy import：rapidocr（新包 v3）与 rapidocr_onnxruntime（旧包 v1）都不在 → OCRError(category="environment")。
 模型实例进程内单例缓存。
 """
 from __future__ import annotations

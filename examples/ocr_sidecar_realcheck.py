@@ -2,10 +2,11 @@
 
 运行：PYTHONPATH=<repo>/src python examples/ocr_sidecar_realcheck.py
 
-**按需真跑，不进 18 个 demo 的回归线**（同 `dsp_trim_realcheck.py` 的先例）：本脚本要求解释器里
-装了 **`rapidocr`（新包）**，而本仓 `environment.yml` 现钉的是旧包 `rapidocr-onnxruntime`
-（本机实况亦然）——放进回归线会让「18 个 demo 全 PASS」在没装新包的环境里变成一条假失败。
-装上 `rapidocr` 之后本脚本约 10 秒跑完，随时可加进回归线（那是另一件事）。
+**按需真跑，不进 18 个 demo 的回归线**（同 `dsp_trim_realcheck.py` 的先例）：本脚本要求解释器里真有
+**`rapidocr` 引擎**（新包 v3；`environment.yml` 自 2026-10-16 修包名漂移后钉的正是 `rapidocr>=3.10`），
+并真起一个侧车 HTTP 服务、真跑推理——与本目录那些「mock 掉全部外部依赖、任何机器都绿」的 demo
+分工相反。缺引擎即 `check(ocr_lines.available())` **当场失败**（绝不把「没装」写成通过）；
+在 conda env `flowmind` 里约 10 秒跑完。
 
 三段式（happy / 默认 / 错误），**全程离线、不花钱、不依赖 GPU 与云密钥**：
 

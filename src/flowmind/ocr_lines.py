@@ -13,8 +13,9 @@
 ``skills/dsp_*.py`` 时从这个顶层模块 import 即可。
 
 **与 ``skills/_local_ocr.py`` 的分工（刻意不合并）**：那一条是**字幕条区域框**（视频本地化，多帧
-聚合 + 尺寸/位置先验），用的是**旧包名** ``rapidocr_onnxruntime``（本机未安装，故其 ``available()``
-现为 False）；本模块用**新包 ``rapidocr`` v3**（``from rapidocr import RapidOCR``），要的是
+聚合 + 尺寸/位置先验），**新旧两个包名都认**（``_engine_flavor()`` 双探、**新包 v3 优先**；
+``environment.yml`` 自 2026-10-16 起钉的也是新包）；本模块用**新包 ``rapidocr`` v3**
+（``from rapidocr import RapidOCR``），要的是
 **逐行文字 + 四点框 + 置信度**，且**不做任何位置/置信度过滤**。两者的依赖与输出契约都不同，
 合并只会让两边互相牵制。
 

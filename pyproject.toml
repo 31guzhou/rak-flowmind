@@ -31,6 +31,10 @@ dev = [
 [project.scripts]
 mcp-base-gpu = "flowmind.server_http:main"   # 单端口唯一入口（MCP + 任务 REST）
 flowmind-mcp = "flowmind.server:main"        # stdio 调试入口
+# ⚠️ 这条命令**不在本文件提依赖**（`dependencies` 只是**服务运行时**的 pip 兜底快照，且侧车刻意
+# 不属于服务）：它要的 `rapidocr` + `onnxruntime` 是**开发环境**那条路的依赖，真源在 `environment.yml`
+# （照文档装即可用；`onnxruntime` 必须显式装，原因见那边的注释）。默认/生产那条路是容器，
+# 依赖钉在 `deploy/ocr-sidecar/Dockerfile`（ADR-100）。
 rapidocr-sidecar = "flowmind.ocr_sidecar:main"  # 本机 OCR 侧车（cross-dashboard 文字核查直连，ADR-097）
 
 [build-system]
