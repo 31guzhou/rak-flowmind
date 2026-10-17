@@ -194,34 +194,46 @@ def parse_size(size: str) -> tuple[int, int]:
     return (w, h) if w > 0 and h > 0 else (0, 0)
 
 
+def duration_value(seconds: str) -> int:
+    """镜头秒数 → 厂商 ``duration``（**整数秒**，至少 1）。
+
+    2026-10-17 真调：该接口认 ``duration``（int），旧请求体里的 ``seconds`` / ``aspect_ratio`` /
+    ``quality`` 都不是它认识的字段——``seedance-2.5-global-sp`` 的 ``invalid_request`` 正是由此暴露。
+    镜头窗口是 2.7–5.6s ⇒ 四舍五入到整秒（成片侧仍会裁到锁定窗口，ADR-080）。
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        value = 4.0
+    return max(1, int(round(value)))
+
+
 def build_payload(
     cfg: DspConfig, *, prompt: str, image_url: str, seconds: str, tail_image_url: str = "",
     motion_params: dict[str, object] | None = None,
 ) -> dict:
-    """按文档组装提交体（``image`` 单图 URL + ``images`` 数组，文档称前者兼容旧客户端）。
+    """按**当前**接口组装提交体（2026-10-17 真调更正，见 ADR-111）。
 
-    ``tail_image_url`` 非空时放进 ``images`` 第 2 位 = **首尾帧桥**（ADR-074）：
-    首帧 = 本镜图、尾帧 = 下一镜图 ⇒ 相邻镜在画面里首尾咬合。空串 = 现状（单图）。
+    ``image`` = 首帧参考素材；``tail_image_url`` 非空时再放进 ``images`` 第 2 位 =
+    **首尾帧桥**（ADR-074）——数组形态在新模型上**尚未真跑验证**，厂商若忽略则退化为单图（无错误画面）。
 
     ``motion_params`` = **运镜的引擎参数位**（ADR-076）。本聚合端点**没有**运动字段，故
     ``motion_expression()`` 当前恒返回空 dict、这里**一个键都不会并进去**（空即不传，不编造厂商参数）。
-    引擎将来透出运动参数时，适配表填好即可经此通道下发——**不必再改本函数**。
+
+    ⚠️ **不注入** ``aspect_ratio`` / ``quality`` / ``seconds``：它们不属于该视频接口的字段，
+    真调会诱发上游 ``invalid_request``（ADR-111）。比例由 ``size`` 表达、时长用 ``duration``。
     """
     payload: dict = {
         "model": cfg.videogen_model,
         "prompt": prompt,
-        "aspect_ratio": cfg.videogen_aspect_ratio,
+        "duration": duration_value(seconds),
         "size": cfg.videogen_size,
-        "seconds": seconds,
-        "quality": cfg.videogen_quality,
     }
     if image_url:
-        # 文档：``image`` = 单图 URL（兼容旧客户端）；``images`` = URL 数组（≤9 张）
-        refs = [image_url]
-        if tail_image_url and tail_image_url != image_url:
-            refs.append(tail_image_url)
         payload["image"] = image_url
-        payload["images"] = refs[: max(1, cfg.videogen_max_ref_images)]
+        if tail_image_url and tail_image_url != image_url:
+            refs = [image_url, tail_image_url]
+            payload["images"] = refs[: max(1, cfg.videogen_max_ref_images)]
     # 运镜参数位（ADR-076）：**空即不传**——本引擎为空，不往请求体里塞不认识的自造字段
     if motion_params:
         payload.update({k: v for k, v in motion_params.items() if k not in payload})

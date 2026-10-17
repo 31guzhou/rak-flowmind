@@ -355,6 +355,10 @@ _DSP_ENV_FIELDS: dict[str, str] = {
     "storage_endpoint": "FLOWMIND_DSP_S3_ENDPOINT",
     "storage_bucket": "FLOWMIND_DSP_S3_BUCKET",
     "storage_region": "FLOWMIND_DSP_S3_REGION",
+    # 公网预签名端点（项目 I2V 前置条件）：内部端点只给本仓读写；厂商拉素材必须用这条。
+    # 未配置时**只有内部端点字面公网**才沿用它，否则如实跳过图生视频（不冒充公网可达）。
+    "storage_public_endpoint": "FLOWMIND_DSP_S3_PUBLIC_ENDPOINT",
+    "storage_public_addressing_style": "FLOWMIND_DSP_S3_PUBLIC_ADDRESSING_STYLE",
     "mediakit_api_base": "FLOWMIND_DSP_MEDIAKIT_API_BASE",
     "mediakit_queue_id": "FLOWMIND_DSP_MEDIAKIT_QUEUE_ID",
     "mediakit_output_destination": "FLOWMIND_DSP_MEDIAKIT_OUTPUT_DESTINATION",
@@ -405,6 +409,19 @@ class DspConfig(BaseModel):
     storage_secure: bool = Field(default=True, validate_default=True)  # env FLOWMIND_DSP_S3_SECURE
     storage_timeout_s: float = 30.0
     presign_ttl_s: int = 3600             # 预签名 URL 有效期（供 MediaKit 取素材）
+
+    # ── **公网**预签名端点（图生视频参考素材，ADR-123）──
+    # 内部端点（storage_endpoint）只给本仓读写；给第三方厂商的预签名 URL 必须由
+    # **公网端点**签发——SigV4 把 Host 签进 URL，签完再改 hostname 必然 403。
+    # 未配置时：内部端点**字面公网**才沿用它；本机/内网端点一律视为「未配置公网入口」
+    # （技能逐镜跳过并回落静图，绝不冒充已具备公网访问能力）。
+    storage_public_endpoint: str = Field(  # env FLOWMIND_DSP_S3_PUBLIC_ENDPOINT
+        default="", validate_default=True)
+    storage_public_secure: bool = Field(  # env FLOWMIND_DSP_S3_PUBLIC_SECURE
+        default=True, validate_default=True)
+    # 公网端点若是虚拟主机风格（bucket.s3.example.com）设 `virtual`；自建 MinIO 反代通常是 `path`。
+    storage_public_addressing_style: str = Field(  # env FLOWMIND_DSP_S3_PUBLIC_ADDRESSING_STYLE
+        default="path", validate_default=True)
 
     # ── 火山 AI MediaKit「多轨道剪辑」（render_compose 的实现落点 · §7）──
     mediakit_api_base: str = Field(  # env FLOWMIND_DSP_MEDIAKIT_API_BASE
@@ -465,28 +482,38 @@ class DspConfig(BaseModel):
 
     # ── 图生视频 · 视频生成（image_to_video 的实现落点 · 契约 §7.5 第 1 步）──
     # 厂商 = 晨星 AI（api.chenxingai.vip，第三方聚合，转售 Seedance / MiniMax 等）。
-    # 文档（用户提供）：提交 ``POST /videos/generations`` 返平铺 ``{id, task_id, status}``
-    # → 轮询 ``GET /videos/{task_id}`` → ``completed`` 后取 ``metadata.url`` 直链（**24h**）。
+    # **2026-10-17 真调更正**（见 ADR-111）：
+    #   ① 视频接口在 ``/v1`` 下且路径是**单数** ``video``：``POST /v1/video/generations``；
+    #      旧记的 ``/videos/generations`` 现在返**前端 SPA 的 HTML**（200 text/html），
+    #      ``/v1/videos/generations`` 也是 404 —— 前者曾被误判成「提交返回非 JSON」。
+    #   ② 轮询 ``GET /v1/videos/{task_id}``（平铺 ``{task_id,status,progress,metadata.url}``；
+    #      ``/v1/video/generations/{task_id}`` 亦可，但返回包一层 ``data``）。
+    #   ③ 默认模型 ``seedance-2.5-global-sp`` 在该渠道视频路由上被上游判 ``invalid_request``；
+    #      真跑可用的视频模型是 ``doubao-seedance-2-0-fast``（同 key、同端点，200 → queued）。
+    #   ④ 请求体字段：``model`` / ``prompt`` / ``duration`` / ``size`` / ``image``；
+    #      ``aspect_ratio`` / ``quality`` **不再注入**（非该接口字段，避免上游 invalid_request）。
+    #   ⑤ **硬约束**：参考素材必须是**公网可访问的 http(s) URL** 或**已入库的 ``asset://``**；
+    #      base64 / ``mediakit://`` / 本机与内网地址一律被拒（真跑逐条验证，见 ADR-111）。
     # ⚠️ 这是**独立第三方**，与火山 MediaKit / 豆包语音不共享端点与密钥。
     videogen_api_base: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_API_BASE
         default="https://api.chenxingai.vip", validate_default=True)
     videogen_key_env: str = "DSP_VIDEOGEN_API_KEY"   # Authorization: Bearer sk-…（密钥只在后端）
-    videogen_submit_path: str = "/videos/generations"
-    videogen_task_path: str = "/videos/{task_id}"
-    videogen_content_path: str = "/videos/{task_id}/content"   # 带鉴权代理下载（备用）
+    videogen_submit_path: str = "/v1/video/generations"
+    videogen_task_path: str = "/v1/videos/{task_id}"
+    videogen_content_path: str = "/v1/videos/{task_id}/content"   # 带鉴权代理下载（备用）
     videogen_timeout_s: float = 60.0        # 单次 HTTP
-    videogen_poll_interval_s: float = 8.0   # 文档建议 5–10s
+    videogen_poll_interval_s: float = 8.0   # 实测 5–10s 合适
     videogen_poll_max_s: float = 1800.0     # 轮询上限（超时如实报错，不假装完成）
     videogen_model: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_MODEL
-        default="seedance-2.5-global-sp", validate_default=True)
+        default="doubao-seedance-2-0-fast", validate_default=True)
     videogen_aspect_ratio: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_ASPECT_RATIO
-        default="9:16", validate_default=True)   # 竖屏（文档：Seedance 默认 9:16）
+        default="9:16", validate_default=True)   # **不进请求体**（比例由 size 表达）
     # 文档可选 size = 1280x720 / 720x1280 / 1024x1024 / 1792x1024 / 1024x1792
     # —— **无 1080x1920**；9:16 里只有 720x1280 是精确比例，成片由 MediaKit 缩到画布。
     videogen_size: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_SIZE
         default="720x1280", validate_default=True)
     videogen_quality: str = Field(  # env FLOWMIND_DSP_VIDEOGEN_QUALITY
-        default="standard", validate_default=True)  # standard | high
+        default="standard", validate_default=True)  # **不进请求体**（该接口无此字段）
     videogen_max_ref_images: int = 9        # 文档：seedance 系列参考图 ≤ 9 张
     videogen_prompt_suffix: str = ""        # 逐镜 prompt 后缀（如统一加「运镜」提示）
     # ── 首尾帧桥（ADR-074；env FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE=0 关）──
@@ -510,6 +537,11 @@ class DspConfig(BaseModel):
     # 源片段比窗口短 ⇒ ``tpad=stop_mode=clone`` 把末帧拖满窗口（画面在结尾静止一拍）。
     # 关掉 ⇒ **不补**（该镜比时间线短），但 ``shortfallMs`` **照实报出**——补不补是策略，短不短是事实。
     videogen_freeze_pad: bool = Field(default=True, validate_default=True)
+    # ── 提交前**公网可达性预检**（ADR-123；env FLOWMIND_DSP_VIDEOGEN_PUBLIC_PROBE=0 关）──
+    # 用公网预签名 URL 真读 1 字节（Range: bytes=0-0）：能提前发现「签名与公网 Host 不匹配 /
+    # 反代没透传 Host / 公网入口没通」，**不浪费按镜计费的厂商提交**。只证明「后端此刻读得到」，
+    # 不承诺厂商网络一定能读——所以仍保留逐镜回落与如实状态。
+    videogen_public_probe: bool = Field(default=True, validate_default=True)
 
     @field_validator(*_DSP_ENV_FIELDS, mode="before")
     @classmethod
@@ -531,9 +563,25 @@ class DspConfig(BaseModel):
             return True
         return v
 
+    @field_validator("storage_public_secure", mode="before")
+    @classmethod
+    def _env_public_secure(cls, v: bool) -> bool:
+        """env FLOWMIND_DSP_S3_PUBLIC_SECURE 覆盖（0/false/no 关；其余不生效）。
+
+        公网端点通常带 scheme（``https://…``）：带 scheme 时本开关不参与拼接；
+        只有 ``S3_PUBLIC_ENDPOINT=host:port`` 这种写法才用它决定 http/https。
+        """
+        ensure_env_loaded()
+        raw = os.environ.get("FLOWMIND_DSP_S3_PUBLIC_SECURE", "").strip().lower()
+        if raw in ("0", "false", "no"):
+            return False
+        if raw in ("1", "true", "yes"):
+            return True
+        return v
+
     @field_validator(
         "videogen_bridge_next_image", "videogen_downscale_input",
-        "videogen_trim_window", "videogen_freeze_pad",
+        "videogen_trim_window", "videogen_freeze_pad", "videogen_public_probe",
         mode="before",
     )
     @classmethod
@@ -545,6 +593,7 @@ class DspConfig(BaseModel):
             "videogen_downscale_input": "FLOWMIND_DSP_VIDEOGEN_DOWNSCALE_INPUT",
             "videogen_trim_window": "FLOWMIND_DSP_VIDEOGEN_TRIM_WINDOW",
             "videogen_freeze_pad": "FLOWMIND_DSP_VIDEOGEN_FREEZE_PAD",
+            "videogen_public_probe": "FLOWMIND_DSP_VIDEOGEN_PUBLIC_PROBE",
         }
         raw = os.environ.get(env_names[info.field_name], "").strip().lower()
         if raw in ("1", "true", "yes"):
