@@ -413,6 +413,10 @@ class DspConfig(BaseModel):
     mediakit_multi_track_path: str = "/api/v1/tools/multi-track-edit"
     mediakit_camera_motion_path: str = "/api/v1/tools/apply-camera-motion"  # 运镜（§7.5 第 2 步）
     mediakit_task_path: str = "/api/v1/tasks/{task_id}"
+    # **本地上传位**（契约 §7.3① 的另一支）：申请预签名 PUT 后把原始字节直传 MediaKit，
+    # 任务里用 ``mediakit://{file_id}`` 引用 ⇒ 素材**不必公网可达**。
+    mediakit_request_upload_path: str = "/api/v1/tools-sync/request-media-upload-url"
+    mediakit_upload_timeout_s: float = 300.0   # 素材 PUT（原始字节）可能很大/很慢，单独给上限
     mediakit_timeout_s: float = 60.0       # 单次 HTTP（提交 / 查询）
     mediakit_poll_interval_s: float = 5.0
     mediakit_poll_max_s: float = 1800.0    # 轮询上限（超时如实报错，不假装完成）

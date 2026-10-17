@@ -102,6 +102,98 @@ def mediakit_configured(cfg: DspConfig) -> bool:
     return bool(get_api_key(cfg.mediakit_key_env))
 
 
+# ── 本地上传（mediakit://）——契约 §7.3① 的另一支 ────────────────────
+# 为什么要有它：``source`` 接受四协议（http(s) / mediakit:// / vod:// / tos://），而**预签名 URL**
+# 那条只有在对象存储**公网可达**时才成立——本机 dev 的 ``127.0.0.1:9000`` 厂商根本拉不到
+# （2026-10-17 真跑：MediaKit 在 render 里如实失败于 ``DownloadFileError``）。
+# 本地上传支：① 申请一个上传位（预签名 PUT）② 把**原始字节**直传 ③ 任务里用 ``mediakit://{file_id}``
+# 引用 ⇒ 素材**不经过任何对外地址**，与对象存储的公网可达性彻底解耦。
+# 厂商文档：``POST {base}/api/v1/tools-sync/request-media-upload-url``（Bearer、body ``{}``）
+# → ``result{upload_url, method, upload_headers[{key,value}], file_id}``；``upload_url`` 24h 有效。
+
+# 上传位响应里**必须有**的字段（缺一个就无法完成上传）——缺失即如实报，不猜。
+_UPLOAD_SLOT_FIELDS = ("upload_url", "file_id")
+
+
+def request_upload_slot(cfg: DspConfig) -> dict[str, object]:
+    """申请一个媒体上传位，返回 ``{upload_url, method, headers, file_id}``。"""
+    api_key = get_api_key(cfg.mediakit_key_env)
+    if not api_key:
+        raise DspMediakitError(
+            f"未配置 MediaKit 密钥 {cfg.mediakit_key_env}（上传渲染素材必需）。",
+            category="environment",
+        )
+    raw = _post(cfg, api_key, cfg.mediakit_request_upload_path, {})
+    if not raw.get("success", True):
+        code, message = _mk_error(raw)
+        category, retriable = _classify_mk_error(code)
+        raise DspMediakitError(
+            f"MediaKit 申请上传位失败：{code} {message}".strip(),
+            category=category, retriable=retriable,
+        )
+    result = raw.get("result")
+    if not isinstance(result, dict):
+        result = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    missing = [f for f in _UPLOAD_SLOT_FIELDS if not str(result.get(f) or "")]
+    if missing:
+        raise DspMediakitError(
+            f"MediaKit 上传位响应缺字段（{'、'.join(missing)}）：{sorted(result)[:12]}",
+            category="video",
+        )
+    headers: dict[str, str] = {}
+    raw_headers = result.get("upload_headers")
+    if isinstance(raw_headers, list):
+        for item in raw_headers:
+            if isinstance(item, dict) and item.get("key"):
+                headers[str(item["key"])] = str(item.get("value") or "")
+    return {
+        "upload_url": str(result["upload_url"]),
+        # 文档给 ``PUT``；不硬编码成唯一可能（若厂商改成 POST，照它说的做）
+        "method": str(result.get("method") or "PUT").upper(),
+        "headers": headers,
+        "file_id": str(result["file_id"]),
+    }
+
+
+def upload_media(cfg: DspConfig, data: bytes, content_type: str) -> str:
+    """把**原始字节**直传 MediaKit，返回任务里可用的 ``mediakit://{file_id}``。
+
+    约束（厂商文档）：``PUT`` 原始二进制（**不是** multipart）、把所有 ``upload_headers`` 带上、
+    ``Content-Type`` 必须与真实文件类型一致（缺省按扩展名推的 ``content_type`` 补）。
+    """
+    if not data:
+        raise DspMediakitError("素材为空，拒绝上传（不拿空文件换一个 file_id）。", category="video")
+    slot = request_upload_slot(cfg)
+    headers = dict(slot["headers"])  # type: ignore[arg-type]
+    if not any(k.lower() == "content-type" for k in headers):
+        headers["Content-Type"] = content_type
+    method = str(slot["method"])
+    if method not in ("PUT", "POST"):
+        raise DspMediakitError(
+            f"MediaKit 上传位给了不认识的方法「{method}」（文档口径是 PUT）——拒绝盲发。",
+            category="video",
+        )
+    try:
+        resp = requests.request(
+            method, str(slot["upload_url"]), data=data, headers=headers,
+            timeout=cfg.mediakit_upload_timeout_s,
+        )
+    except requests.exceptions.Timeout as exc:
+        raise DspMediakitError("MediaKit 素材上传超时", category="environment") from exc
+    except requests.exceptions.RequestException as exc:
+        raise DspMediakitError(f"MediaKit 素材上传连接失败：{exc}", category="environment") from exc
+    if not resp.ok:
+        raise DspMediakitError(
+            f"MediaKit 素材上传失败（HTTP {resp.status_code}）：{resp.text[:200]}",
+            category="transient" if resp.status_code >= 500 else "video",
+            retriable=resp.status_code >= 500,
+        )
+    # 文档响应示例里 ``result.file_id`` 本身**已经**是 ``mediakit://…``（不是裸 id）——
+    # 故两种形态都要接住：已带前缀就用它，裸 id 才补前缀。盲目再拼一次会得到 ``mediakit://mediakit://…``。
+    file_id = str(slot["file_id"])
+    return file_id if file_id.startswith("mediakit://") else f"mediakit://{file_id}"
+
+
 # ── 运镜：整块退役（ADR-076）────────────────────────────────────
 # 旧路径 = 对**已生成片段**调 MediaKit `apply-camera-motion` 做事后 pan-zoom（契约 §7.5 第 2 步）。
 # 2026-10-14 改判：运镜改由「运镜导演」产出结构化方案 → `image_to_video` 经引擎适配器**并入 prompt、

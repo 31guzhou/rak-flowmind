@@ -16,6 +16,7 @@
 | `豆包语音_错误码查询_1789027400.pdf` | 豆包语音错误码 | 本文表 A |
 | `AI MediaKit_多轨道剪辑_1788492356.pdf` | 多轨道剪辑参数模型 | `skills/_dsp_mediakit.py` |
 | `AI MediaKit_提交多轨道剪辑任务 API_1788490836.pdf` | 提交/查询任务 API | `skills/_dsp_mediakit.py` |
+| `智能处理_获取媒体上传地址 API_1785483287.pdf` | 本地上传：申请上传位（PUT 原始字节）→ `mediakit://{file_id}` 引用 | `skills/_dsp_mediakit.py`（`request_upload_slot` / `upload_media`） |
 | `AIMediaKit_公共错误码_1775248816.pdf` | 火山公共错误码（字符串名） | 本文表 B |
 | `智能处理_视频添加运镜_1785416057.pdf` | 运镜（`apply-camera-motion`，只吃视频） | `skills/dsp_render_compose.py`（运镜缺口告警） |
 

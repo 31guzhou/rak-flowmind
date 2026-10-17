@@ -12,7 +12,9 @@
   **不得**直接当 ``storedKey``；须落 ``{outputPrefix}/{runId}/final.mp4`` 再回 key。
 - **运镜（ADR-076 改判）**：运镜已由 ``image_to_video`` 经引擎适配器并入 prompt **随生成落地**；
   本步**不再施加**（旧的 MediaKit ``apply-camera-motion`` 事后 pan-zoom 已退役——重复施加会叠加两次运动）。
-- §7.1 素材经**预签名 URL**（同源 ``/api/assets`` 火山拉不到，须换成可达引用）。
+- §7.3① 素材走**本地上传**：先把每个 key 的字节直传 MediaKit，再用 ``mediakit://{file_id}``
+  引用（不再签预签名 URL）——本机 / 内网的对象存储端点厂商拉不到，预签名那条在 dev 必失败
+  （2026-10-17 真跑：``render_compose`` 失败于 ``DownloadFileError``）。
 - §7.3④ AIGC 标识：``extra_param.upload.aigc_meta`` 由 MediaKit 客户端注入。
 
 降级 **abort**：失败即抛错（``invoke()`` 兜成 ``ok=False``），运行器据此中止整单，
@@ -57,9 +59,38 @@ class RenderComposeData(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-def _presign(key: str) -> str:
-    """素材 key → 预签名 URL（空 key 返回空串，由调用方跳过）。"""
-    return storage.presign_get(key) if key else ""
+def _media_ref_factory(cfg, warnings: list[str]):  # noqa: ANN001, ANN202  两个返回值的闭包工厂
+    """素材 key → MediaKit 可引用地址（**本地上传 + ``mediakit://``**，契约 §7.3①）。
+
+    为什么不再用预签名 URL：``source`` 的四协议里 ``http(s)://`` 只在**对象存储公网可达**时成立，
+    而本机 / 内网端点（``127.0.0.1:9000``）厂商根本拉不到——真跑里 ``render_compose`` 正是失败在
+    ``DownloadFileError``。本地上传把**字节直接**送进 MediaKit，素材与公网可达性彻底解耦。
+
+    同一 key 在**一次渲染里只传一次**（同一张静图会被多镜引用）。空 key 返回空串（调用方跳过）。
+    """
+    cache: dict[str, str] = {}
+    uploaded = 0
+
+    def ref(key: str) -> str:
+        nonlocal uploaded
+        if not key:
+            return ""
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        data = storage.get_bytes(key)
+        cache[key] = mediakit.upload_media(cfg, data, storage.content_type_for(key))
+        uploaded += 1
+        return cache[key]
+
+    def report() -> None:
+        """把「这一轮到底传了什么」如实记进 warnings（不静默）。"""
+        if uploaded:
+            warnings.append(
+                f"素材已上传 MediaKit：{uploaded} 个（``mediakit://`` 引用，不依赖对象存储公网可达）"
+            )
+
+    return ref, report
 
 
 def _split_stickers(raw: object) -> tuple[list[dict], list[str]]:
@@ -174,6 +205,8 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
         )
 
     warnings: list[str] = []
+    # 素材引用：本地上传 MediaKit 后得到 ``mediakit://``（契约 §7.3①；见该工厂的注释）
+    ref, report_uploads = _media_ref_factory(cfg, warnings)
 
     # ── 逐镜素材：``video`` 节点（图生视频）的片段优先，缺片段回落静图 ──
     video_dep = common.dep(inp.deps, "video") or {}
@@ -186,7 +219,7 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
     # 主轨：有 I2V 片段的镜头用片段、其余回落静图。**运镜不在这里施加**（ADR-076：已随生成落地）。
     clip_urls: dict[str, str] = {}
     for shot_id, clip in clip_by_shot.items():
-        clip_urls[shot_id] = _presign(str(clip["key"]))
+        clip_urls[shot_id] = ref(str(clip["key"]))
     if clip_urls:
         warnings.append(f"主轨用图生视频片段：{len(clip_urls)} 镜")
 
@@ -196,7 +229,7 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
         for track in edl.tracks if track.kind == "image"
         for seg in track.segments if seg.sourceKey
     }
-    image_urls = {key: _presign(key) for key in still_keys}
+    image_urls = {key: ref(key) for key in still_keys}
 
     tts = common.dep(inp.deps, "tts") or {}
     bgm = common.dep(inp.deps, "bgm") or {}
@@ -233,14 +266,16 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
         edl,
         image_urls=image_urls,
         clip_urls=clip_urls,
-        audio_url=_presign(audio_key),
-        bgm_url=_presign(str(bgm.get("bgmKey") or "")),
-        srt_url=_presign(str(subtitle.get("srtKey") or "")),
+        audio_url=ref(audio_key),
+        bgm_url=ref(str(bgm.get("bgmKey") or "")),
+        srt_url=ref(str(subtitle.get("srtKey") or "")),
         subtitle_font_size=inp.subtitleFontSize,
         canvas_width=cfg.mediakit_canvas_width,
         canvas_height=cfg.mediakit_canvas_height,
         transition_region=cfg.mediakit_transition_region,
     )
+    # 「这一轮到底传了哪些素材」如实进 warnings（在 build_tracks 之后：此时所有引用都已生成）
+    report_uploads()
     if not tracks:
         raise mediakit.DspMediakitError(
             "渲染轨道为空：EDL 各镜均未选到图（timeline 已留空位）——无可渲染内容。",

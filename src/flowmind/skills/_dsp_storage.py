@@ -171,6 +171,9 @@ def presign_get(key: str, ttl_s: int | None = None) -> str:
     """为读取生成预签名 URL（§7.1：素材可走 ``http(s)://`` 供 MediaKit 拉取）。
 
     现签现用、**不入库**（契约 §7.3①：对象 key 不可变语义不变）。
+    ⚠️ 2026-10-17 起 ``render_compose`` **不再走这条**：本机 / 内网端点（如 ``127.0.0.1:9000``）
+    厂商拉不到 ⇒ 改成「先上传 MediaKit，再用 ``mediakit://`` 引用」（见 ``get_bytes`` 与
+    ``_dsp_mediakit.upload_media``）。本函数保留给**端点确实公网可达**的部署与排障使用。
     """
     assert_key_shape(key)
     ttl = ttl_s or load_config().dsp.presign_ttl_s
@@ -181,6 +184,23 @@ def presign_get(key: str, ttl_s: int | None = None) -> str:
         raise
     except Exception as exc:  # noqa: BLE001
         raise DspStorageError(f"预签名失败（{key}）：{exc}", category="transient",
+                              retriable=True) from exc
+
+
+def get_bytes(key: str) -> bytes:
+    """读出对象**原始字节**（渲染素材上传 MediaKit 用；契约 §7.3① 的本地上传支）。
+
+    与 ``presign_get`` 的区别：不签发任何对外地址——素材由**本仓自己**送出去，
+    故与对象存储的**公网可达性彻底解耦**（本机 dev 也能真渲染）。
+    """
+    assert_key_shape(key)
+    try:
+        obj = _client().get_object(Bucket=_bucket(), Key=key)
+        return obj["Body"].read()
+    except DspStorageError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise DspStorageError(f"对象读取失败（{key}）：{exc}", category="transient",
                               retriable=True) from exc
 
 

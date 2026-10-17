@@ -12,9 +12,11 @@
 6. **逐镜剪辑记录 ``editSegments[]``**（ADR-080 阶段 5）：时间轴位置 / 剪辑时长 / 音轨 / **实际施加**的
    转场（未登记 ⇒ 实况硬切，**请求 ≠ 实况**）/ 裁切实况（i2v 带出的 ``trim``）/ 降级模式（静图回落 / 空段）/
    BGM 恒降级如实标出
+7. **素材本地上传**（契约 §7.3①）：静图 / 音轨 / 字幕先把**字节**传 MediaKit，任务里只用
+   ``mediakit://{file_id}`` 引用——不再依赖对象存储公网可达（本机 ``127.0.0.1:9000`` 也能真渲染）
 
-mock 方式：替换 ``_dsp_mediakit.render``（模块级薄适配层）
-与 ``_dsp_storage`` 的 presign/fetch/put_file，不需要网络 / MediaKit 密钥 / 对象存储。
+mock 方式：替换 ``_dsp_mediakit.render`` / ``_dsp_mediakit.upload_media``（模块级薄适配层）
+与 ``_dsp_storage`` 的 get_bytes/fetch/put_file，不需要网络 / MediaKit 密钥 / 对象存储。
 密钥用假值经 env 注入。
 """
 
@@ -32,6 +34,7 @@ from flowmind.skills import _dsp_storage as storage
 _KEY_ENV = "DSP_MEDIAKIT_API_KEY"
 _BODY: dict = {}
 _PUTS: list[str] = []    # 所有 put_file 的 key 序列（运镜退役后只有成片）
+_UPLOADS: list[tuple[str, str]] = []  # 本地上传 MediaKit 的 (素材 key, content-type) 序列
 
 
 def section(title: str) -> None:
@@ -59,13 +62,19 @@ def _install_fakes() -> None:
         _BODY["_stored"] = key
         return key
 
-    def presign_get(key: str, ttl_s: int | None = None) -> str:
-        return f"https://assets.example/{key}"
+    def get_bytes(key: str) -> bytes:
+        return f"bytes:{key}".encode()
+
+    def upload_media(cfg, data: bytes, content_type: str) -> str:  # noqa: ANN001
+        key = data.decode().removeprefix("bytes:")
+        _UPLOADS.append((key, content_type))
+        return f"mediakit://file-{len(_UPLOADS)}"
 
     mediakit.render = render
+    mediakit.upload_media = upload_media
     storage.fetch_to_file = fetch_to_file
     storage.put_file = put_file
-    storage.presign_get = presign_get
+    storage.get_bytes = get_bytes
 
 
 def _edl() -> dict:
@@ -148,6 +157,11 @@ def main() -> None:
     check(_BODY["output"]["cover"]["cover_time"] == [0], "封面走 output.cover 抽帧")
     check(len(_BODY["track"][0]) == 2, "图片主轨两段")
     check(any("平台组件" in w for w in d.warnings), "商品链接不烧进画面须如实说明")
+    # 契约 §7.3① 的本地上传支：静图 / 音轨 / 字幕都先传字节，任务里只用 mediakit:// 引用
+    check(len(_UPLOADS) == 4, f"应上传 4 个素材（2 静图 + 1 音轨 + 1 字幕），实际 {len(_UPLOADS)}")
+    check(all(u[0].startswith("dsp/scratch/") for u in _UPLOADS), "上传的是对象 key（字节），不是 URL")
+    check(_BODY["track"][0][0]["source"].startswith("mediakit://"), "主轨素材须用 mediakit:// 引用")
+    check(any("mediakit://" in w for w in d.warnings), "上传了几个素材须如实进 warnings")
 
     section("2) error：缺渲染密钥（abort 步）→ 明确报错，不伪造成片")
     os.environ.pop(_KEY_ENV, None)
