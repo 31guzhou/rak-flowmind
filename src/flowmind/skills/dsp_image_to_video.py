@@ -37,7 +37,7 @@ from __future__ import annotations
 import hashlib
 import tempfile
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -102,9 +102,48 @@ class ShotClip(BaseModel):
                     "**全 0 = 未裁切/未实测**（开关关、裁切失败、或复用上次产物）——render 侧原样透出")
 
 
+# 逐镜状态的**稳定原因码**（前端 / 运行器据此区分「前置条件不满足」与「厂商调用失败」；
+# 中文 detail 只给人看，状态判定不解析文本）。
+ShotVideoStatusId = Literal["generated", "reused", "skipped", "failed"]
+
+
+class ShotVideoStatus(BaseModel):
+    """一镜的图生视频**真实结局**（ADR-123）。
+
+    为什么单列：``clips[]`` 只装成功片段，``warnings[]`` 是散装文本——「这镜到底出了视频、
+    复用了旧片、还是回落静图，为什么」事后无法按结构查。运行器把本列表汇总进
+    step note 并以 ``summary`` 决定 ``video`` 步是否降级（**不因静图回落成功就标完成**）。
+    """
+    shotId: str
+    status: ShotVideoStatusId
+    reason: str = Field(
+        default="",
+        description="稳定原因码：source_url_unreachable / no_image / no_prompt / max_shots / "
+                    "reused_existing / vendor_submit_failed / vendor_generation_failed / transfer_failed")
+    detail: str = Field(default="", description="给人看的原因（**不含预签名 URL 查询串**）")
+    key: str = Field(default="", description="片段对象 key（generated / reused 时非空）")
+    runId: str = Field(default="", description="产出该片段的运行 id（与 key 命名空间一致）")
+    atMs: int = 0
+    durationMs: int = 0
+    imageKey: str = Field(default="", description="本镜绑定的素材 key（回落静图时保留绑定关系）")
+
+
+class VideoStatusSummary(BaseModel):
+    """逐镜状态汇总（运行器 / 阶段进度只看这四个计数，不解析 warning 文本）。"""
+    total: int = 0
+    generated: int = 0
+    reused: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
 class ImageToVideoData(BaseModel):
-    """出参：逐镜片段 + 如实说明。"""
+    """出参：逐镜片段 + 逐镜状态 + 如实说明。"""
     clips: list[ShotClip] = Field(default_factory=list)
+    shots: list[ShotVideoStatus] = Field(
+        default_factory=list,
+        description="逐镜真实结局（含跳过 / 失败原因；**成功生成时带片段 key 与 runId**）")
+    summary: VideoStatusSummary = Field(default_factory=VideoStatusSummary)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -121,9 +160,13 @@ class _Job(NamedTuple):
     motion_params: dict[str, object]
 
 
-def _presign(key: str) -> str:
-    """素材 key → 预签名 URL（图生视频要公网可达的图；空 key 返回空串）。"""
-    return storage.presign_get(key) if key else ""
+def _presign_public(key: str) -> str:
+    """素材 key → **公网可读**预签名 URL（空 key 返回空串）。
+
+    与 ``storage.presign_get``（内部端点）分开：厂商要求公网可访问，而 SigV4 把 Host 签进
+    URL——必须由**公网端点**签发（ADR-123）。未配置公网入口时抛 ``DspStorageError``。
+    """
+    return storage.presign_get_public(key) if key else ""
 
 
 def _next_image_key(shots: list[common.DspEdlShot], idx: int) -> str:
@@ -139,24 +182,55 @@ def _next_image_key(shots: list[common.DspEdlShot], idx: int) -> str:
 
 def _i2v_image_url(
     inp: ImageToVideoInput, cfg: DspConfig, key: str, cap: tuple[int, int],
-    cache: dict[str, str], warnings: list[str], stats: dict[str, int],
-) -> str:
-    """素材 key → 下发用预签名 URL；超 ``cap`` 先等比降采样（ADR-074）。取不到 URL 返回空串。
+    cache: dict[str, tuple[str, str]], warnings: list[str], stats: dict[str, int],
+) -> tuple[str, str]:
+    """素材 key → ``(公网预签名 URL, 不可用原因码)``；原因码空串 = 可用。
 
-    同一素材 key **只准备一次**（首尾帧桥下相邻镜会共用同一张图）；降采样失败**回落原图**
+    三步前置检查（**先检查、再提交**，不浪费厂商按镜计费）：
+      ① 公网端点签发（内部端点签的地址厂商拉不到；签完改 host 会 403）；
+      ② 字面主机检查（本机 / 私网 / 集群服务名 ⇒ ``source_url_unreachable``）；
+      ③ HTTP 预读 1 字节（签名 / 反代 / 路径不匹配 ⇒ 同上；开关可关）。
+    同一素材 key **只准备一次**（首尾帧桥下相邻镜共用同一张图）；降采样失败**回落原图**
     并如实告警——画质风险，不是成片失败，不因此丢掉整镜。
     """
     if key in cache:
         return cache[key]
     try:
-        src_url = _presign(key)
+        src_url = _presign_public(key)
     except storage.DspStorageError as exc:
-        warnings.append(f"素材 {Path(key).name} 无法预签名（{exc}）——跳过该镜图生视频")
-        cache[key] = ""
-        return ""
+        code = getattr(exc, "code", "") or "presign_failed"
+        warnings.append(
+            f"素材 {Path(key).name} 无法签发公网预签名地址（{code}：{exc}）——"
+            "该镜**跳过图生视频**（回落静图，不提交厂商）。")
+        cache[key] = ("", "source_url_unreachable")
+        return cache[key]
+    # **厂商硬约束**（2026-10-17 真调，ADR-111）：参考素材必须是公网 http(s) 或已入库的 asset://，
+    # base64 / mediakit:// / 本机与内网地址一律拒绝。公网端点若被配成本机/内网，这里提前拦下。
+    public, host = storage.public_url_host(src_url)
+    if not public:
+        warnings.append(
+            f"素材 {Path(key).name} 的预签名地址是本机/内网（{host or '未知主机'}）——"
+            "厂商要求**公网可访问的 http(s) URL** 或已入库的 asset://，本机对象存储厂商拉不到；"
+            "该镜**跳过图生视频**（回落静图）。"
+            "修复：配置公网可达的对象存储端点（`FLOWMIND_DSP_S3_PUBLIC_ENDPOINT`），"
+            "或先在厂商素材库入库。")
+        cache[key] = ("", "source_url_unreachable")
+        return cache[key]
+    if cfg.videogen_public_probe:
+        readable, why = storage.probe_public_read(src_url)
+        if not readable:
+            warnings.append(
+                f"素材 {Path(key).name} 公网预检失败（{why}）——**不提交厂商**（不浪费按镜计费）；"
+                "该镜回落静图。请检查公网端点 / 反向代理是否透传 Host、签名是否与公网域名匹配。")
+            cache[key] = ("", "source_url_unreachable")
+            return cache[key]
+    else:
+        warnings.append(
+            f"素材 {Path(key).name} 仅做字面公网判定（公网 HTTP 预检开关已关）——"
+            "签名 / 反代是否真正匹配未验证，厂商若拒绝该镜将如实记为失败。")
     if not (cap[0] and cap[1]):
-        cache[key] = src_url
-        return src_url
+        cache[key] = (src_url, "")
+        return cache[key]
 
     suffix = Path(key).suffix.lower()
     out_suffix = suffix if suffix in _IMAGE_SUFFIXES else ".jpg"
@@ -169,8 +243,8 @@ def _i2v_image_url(
             src = storage.fetch_to_file(src_url, str(Path(tmp) / f"orig{suffix or out_suffix}"))
             w, h = media.probe_image_size(src)
             if w <= cap[0] and h <= cap[1]:
-                cache[key] = src_url           # 已不超 ⇒ 原图直用，不落派生件
-                return src_url
+                cache[key] = (src_url, "")           # 已不超 ⇒ 原图直用，不落派生件
+                return cache[key]
             fitted = media.scale_image_to_fit(src, str(Path(tmp) / f"fit{out_suffix}"), *cap)
             storage.put_file(fitted, derived_key,
                              content_type=storage.content_type_for(derived_key))
@@ -179,13 +253,21 @@ def _i2v_image_url(
             f"素材 {Path(key).name} 降采样失败（{exc}）——**回落原图下发**"
             f"（指南：输入**超过输出分辨率** {cap[0]}x{cap[1]} 易出指纹状纹理；本镜未能核实尺寸，"
             "画质可能受影响）")
-        cache[key] = src_url
-        return src_url
+        cache[key] = (src_url, "")
+        return cache[key]
 
     stats["downscaled"] += 1
-    url = _presign(derived_key)
-    cache[key] = url
-    return url
+    try:
+        url = _presign_public(derived_key)
+    except storage.DspStorageError as exc:
+        code = getattr(exc, "code", "") or "presign_failed"
+        warnings.append(
+            f"降采样派生件 {Path(derived_key).name} 无法签发公网预签名地址（{code}：{exc}）——"
+            "该镜**跳过图生视频**（回落静图）。")
+        cache[key] = ("", "source_url_unreachable")
+        return cache[key]
+    cache[key] = (url, "")
+    return cache[key]
 
 
 def _degraded(reason: str, note: str, risk: str) -> SkillOutput[ImageToVideoData]:
@@ -219,6 +301,41 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             "开启「图生视频」开关即需配置该密钥；未配置时如实降级，绝不伪造片段。")
 
     warnings: list[str] = []
+    # 逐镜真实结局（含跳过 / 失败；成功时带片段 key 与 runId）。运行器只认这份结构化结果，
+    # **不解析 warning 文本**——否则「静图回落成功」会被误当成图生视频阶段完成（ADR-123）。
+    statuses: dict[str, ShotVideoStatus] = {}
+
+    def _mark(shot_id: str, status: ShotVideoStatusId, *, reason: str = "", detail: str = "",
+              key: str = "", at_ms: int = 0, duration_ms: int = 0, image_key: str = "") -> None:
+        statuses[shot_id] = ShotVideoStatus(
+            shotId=shot_id, status=status, reason=reason, detail=detail,
+            key=key, runId=inp.runId if key else "",
+            atMs=at_ms, durationMs=duration_ms, imageKey=image_key)
+
+    def _mark_job(job: _Job, status: ShotVideoStatusId, *, reason: str = "", detail: str = "",
+                  key: str = "") -> None:
+        _mark(job.shot_id, status, reason=reason, detail=detail, key=key,
+              at_ms=job.at_ms, duration_ms=job.duration_ms, image_key=job.image_key)
+
+    def _summary() -> VideoStatusSummary:
+        values = list(statuses.values())
+        return VideoStatusSummary(
+            total=len(values),
+            generated=sum(1 for s in values if s.status == "generated"),
+            reused=sum(1 for s in values if s.status == "reused"),
+            skipped=sum(1 for s in values if s.status == "skipped"),
+            failed=sum(1 for s in values if s.status == "failed"),
+        )
+
+    def _reason_counts(status: str) -> list[str]:
+        """某状态下的原因分布（「source_url_unreachable 3」这种），便于一眼定位。"""
+        counts: dict[str, int] = {}
+        for item in statuses.values():
+            if item.status == status and item.reason:
+                counts[item.reason] = counts.get(item.reason, 0) + 1
+        return [f"{reason} {count}" for reason, count in
+                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
     # 文案 / 画面提示词**从 EDL 读**（ADR-070/073）：镜头在 timeline 里经收口（并/拆）后 id 会重排为
     # `s1..sK`，终版镜头的文案与画面提示词已随镜落进 `edl.shots[]`——回查 inp.shots 会**错配**。
     # 兜底：EDL 无该字段（旧快照）时按 id 回查下发的 shots（尽力而为，不臆造）。
@@ -244,6 +361,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     for idx, shot in enumerate(shots):
         if not shot.imageSourceKey:
             warnings.append(f"镜头 {shot.id} 无图（timeline 已留空位）——跳过图生视频")
+            _mark(shot.id, "skipped", reason="no_image", detail="时间线该镜没有绑定素材图",
+                  at_ms=shot.atMs, duration_ms=shot.durationMs)
             continue
         # **画面提示词优先**（ADR-073）：把**台词**当画面提示词会让模型把字幕烧进画面，
         # 故顺序是 visualPrompt（EDL → 下发 shots）→ copy 兜底，并对兜底**如实计数**。
@@ -252,6 +371,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         prompt = visual or fallback_copy
         if not prompt:
             warnings.append(f"镜头 {shot.id} 无画面提示词也无文案（prompt 为空）——跳过图生视频（不凭空编 prompt）")
+            _mark(shot.id, "skipped", reason="no_prompt", detail="既无画面提示词也无口播文案",
+                  at_ms=shot.atMs, duration_ms=shot.durationMs, image_key=shot.imageSourceKey)
             continue
         if not visual:
             fell_back += 1
@@ -277,6 +398,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             seconds=videogen.seconds_str(shot.durationMs),
             motion_params=motion_params,
         ))
+        # 先记「待处理」；后续提交 / 收片会把它改写成 generated / failed，maxShots 截断则改 skipped。
+        _mark_job(jobs[-1], "skipped", reason="not_attempted", detail="待生成")
     if fell_back:
         warnings.append(
             f"{fell_back} 个镜头没有画面提示词（visualPrompt），已**回落用口播文案**出 prompt——"
@@ -288,10 +411,14 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             "（按固定机位生成）；要启用请在镜头剪辑页打开「运镜」开关。")
     if inp.maxShots and len(jobs) > inp.maxShots:
         warnings.append(f"超过 maxShots={inp.maxShots}：仅生成前 {inp.maxShots} 镜（其余回落静图）")
+        for job in jobs[inp.maxShots:]:
+            _mark_job(job, "skipped", reason="max_shots",
+                      detail=f"超过本次成本上限 maxShots={inp.maxShots}，未提交厂商")
         jobs = jobs[:inp.maxShots]
     if not jobs:
+        summary = _summary()
         return SkillOutput(
-            data=ImageToVideoData(warnings=warnings),
+            data=ImageToVideoData(shots=list(statuses.values()), summary=summary, warnings=warnings),
             reasoning=[common.chain("图生视频未生成：无可生成的镜头",
                                     risk_note="各镜缺图或缺文案；请补齐素材/文案后重跑。")],
             confidence=0.0, degraded=True, degradation_reason="no-generatable-shots")
@@ -308,6 +435,9 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             if job.shot_id not in regen and storage.exists(key):
                 reused_clips.append(ShotClip(
                     shotId=job.shot_id, key=key, atMs=job.at_ms, durationMs=job.duration_ms))
+                _mark_job(job, "reused", reason="reused_existing",
+                          detail="确定性 key 上已有片段，按 ADR-079 复用（未重新出片、未重复计费）",
+                          key=key)
             else:
                 to_generate.append(job)
         if reused_clips:
@@ -316,23 +446,35 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                 f"本次只生成 {len(to_generate)} 镜")
         jobs = to_generate
     if not jobs and not reused_clips:
+        summary = _summary()
         return SkillOutput(
-            data=ImageToVideoData(warnings=warnings),
+            data=ImageToVideoData(shots=list(statuses.values()), summary=summary, warnings=warnings),
             reasoning=[common.chain("没有可生成的镜头（缺图 / 缺文案）",
                                     risk_note="各镜缺图或缺文案；请补齐素材/文案后重跑。")],
             confidence=0.0, degraded=True, degradation_reason="no-generatable-shots")
 
     # ── 先全部提交（厂商侧并行跑），再逐个等 ──
     # 素材图在这时才逐张准备（降采样要下载+缩放+转存，只对**真要生成的镜**做）。
-    url_cache: dict[str, str] = {}
+    url_cache: dict[str, tuple[str, str]] = {}
     stats = {"downscaled": 0}
     submitted: list[tuple[_Job, str]] = []
     for job in jobs:
-        image_url = _i2v_image_url(inp, cfg, job.image_key, cap, url_cache, warnings, stats)
+        image_url, prepare_reason = _i2v_image_url(
+            inp, cfg, job.image_key, cap, url_cache, warnings, stats)
         if not image_url:
+            # **前置检查失败**（公网端点未配 / 端点字面内网 / 预签名失败 / 公网预检失败）：
+            # 该镜 skipped（不是 failed）——厂商一次都没调，别把「没提交」说成「生成失败」。
+            _mark_job(job, "skipped", reason=prepare_reason or "source_url_unreachable",
+                      detail="参考素材不可公网读取，未提交厂商")
             continue
-        tail_url = (_i2v_image_url(inp, cfg, job.tail_key, cap, url_cache, warnings, stats)
-                    if job.tail_key else "")
+        tail_url = ""
+        if job.tail_key:
+            tail_url, tail_reason = _i2v_image_url(
+                inp, cfg, job.tail_key, cap, url_cache, warnings, stats)
+            if not tail_url:
+                warnings.append(
+                    f"镜头 {job.shot_id} 的尾帧素材不可用（{tail_reason or 'source_url_unreachable'}）"
+                    "——本镜**按单图下发**（不因尾帧失败丢整镜）")
         # **有界重试**（ADR-079）：厂商把错误分成了 transient/其它（`DspVideoGenError.retriable`），
         # 而此前这个标志**被丢掉了**——瞬时抖动也直接判该镜回落静图，白白浪费一镜的配额。
         # 只对 `retriable` 重试，最多 `_SUBMIT_ATTEMPTS` 次；其余错误立刻如实报出（不无脑重试）。
@@ -353,8 +495,9 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                     f"镜头 {job.shot_id} 提交瞬时失败（第 {attempt} 次，{exc.category}）：{exc}——重试")
         if not task_id:
             exc = last
-            detail = f"（{exc.category}）：{exc}" if exc else "：未知原因"
-            warnings.append(f"镜头 {job.shot_id} 提交失败{detail}——该镜回落静图")
+            detail = f"（{exc.category}）：{exc}" if exc else "未知原因"
+            warnings.append(f"镜头 {job.shot_id} 提交失败（{detail}）——该镜回落静图")
+            _mark_job(job, "failed", reason="vendor_submit_failed", detail=detail)
             continue
         submitted.append((job, task_id))
 
@@ -371,10 +514,24 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         frames: list[str] = []
         frame_stats: dict[str, Any] = {}
         trim = common.DspEditTrim()
+        key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
+        # ① **厂商侧**：轮询到终态。失败与「前置检查不通过」分开记（reason 不同）。
         try:
             raw = videogen.wait(cfg, task_id)
-            url = videogen.result_url(raw)
-            key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
+        except videogen.DspVideoGenError as exc:
+            detail = f"（{exc.category}）：{exc}"
+            warnings.append(f"镜头 {job.shot_id} 出片失败{detail}——该镜回落静图")
+            _mark_job(job, "failed", reason="vendor_generation_failed", detail=detail)
+            continue
+        url = videogen.result_url(raw)
+        if not url:
+            detail = "厂商任务完成但缺少视频直链（metadata.url / url）"
+            warnings.append(f"镜头 {job.shot_id} 出片失败：{detail}——该镜回落静图")
+            _mark_job(job, "failed", reason="vendor_generation_failed", detail=detail)
+            continue
+        # ② **本仓侧**：下载 → 裁到窗口 → 转存 →（qc 开时）抽帧。任何一步失败都记 transfer_failed，
+        # 与厂商失败区分开（排查方向不同：一个是配额/提示词，一个是存储/转存）。
+        try:
             with tempfile.TemporaryDirectory(prefix="dsp-i2v-") as tmp:
                 local = storage.fetch_to_file(url, str(Path(tmp) / f"{job.shot_id}.mp4"))
                 # **裁到镜头窗口**（ADR-080）：模型给的时长与 timeline 锁定的窗口不是同一个数——
@@ -421,12 +578,14 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                     except media.MediaError as exc:
                         warnings.append(
                             f"镜头 {job.shot_id} 抽帧/测量失败（{exc}）——本次不做客观量（如实跳过）")
-        except (videogen.DspVideoGenError, storage.DspStorageError) as exc:
-            warnings.append(f"镜头 {job.shot_id} 出片/转存失败：{exc}——该镜回落静图")
+        except (storage.DspStorageError, media.MediaError) as exc:
+            warnings.append(f"镜头 {job.shot_id} 转存/裁切失败：{exc}——该镜回落静图")
+            _mark_job(job, "failed", reason="transfer_failed", detail=str(exc))
             continue
         clips.append(ShotClip(shotId=job.shot_id, key=key, atMs=job.at_ms,
                               durationMs=job.duration_ms, frames=frames,
                               frameStats=frame_stats, trim=trim))
+        _mark_job(job, "generated", key=key)
 
     if trimmed or padded:
         bits: list[str] = []
@@ -447,17 +606,32 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             f"{len(reused_clips)} 镜复用已有片段（沿用上次产物，未重新裁切）——"
             "其 trim 实况不在本次测量范围（按 0 上报）")
 
-    failed = len(jobs) - len(clips)
-    if not clips:
+    summary = _summary()
+    produced = summary.generated + summary.reused
+    fell_back_count = summary.skipped + summary.failed
+    skip_reasons = _reason_counts("skipped")
+    fail_reasons = _reason_counts("failed")
+    if produced == 0:
+        reason_bits = "；".join([*skip_reasons, *fail_reasons])
         return SkillOutput(
-            data=ImageToVideoData(warnings=warnings),
-            reasoning=[common.chain("图生视频全部失败：成片回落静图",
-                                    risk_note="各镜均未出片；请检查密钥/余额/模型参数后重跑。")],
-            confidence=0.0, degraded=True, degradation_reason="all-shots-failed")
+            data=ImageToVideoData(
+                shots=list(statuses.values()), summary=summary, warnings=warnings),
+            reasoning=[common.chain(
+                "图生视频未产出片段：成片回落静图"
+                + (f"（{reason_bits}）" if reason_bits else ""),
+                risk_note=(
+                    "本步没有真视频片段；render 侧将逐镜回落静图。"
+                    "若是 source_url_unreachable：请配置公网可达的对象存储端点"
+                    "（`FLOWMIND_DSP_S3_PUBLIC_ENDPOINT`），本机 / 内网 MinIO 厂商拉不到。"))],
+            confidence=0.0, degraded=True,
+            degradation_reason=(
+                "all-shots-fell-back" if (summary.failed or summary.skipped)
+                else "no-generatable-shots"))
 
     total_ms = sum(c.durationMs for c in clips)
     bridged = sum(1 for j in jobs if j.tail_key)
     extras = ([f"首尾帧桥 {bridged} 镜"] if bridged else []) + (
+        [f"复用 {summary.reused} 镜（未重复计费）"] if summary.reused else []) + (
         [f"输入降采样 {stats['downscaled']} 张"] if stats["downscaled"] else []) + (
         [f"运镜方案 {motion_planned} 镜"] if motion_planned else []) + (
         [f"固定机位 {no_motion} 镜"] if no_motion else []) + (
@@ -465,15 +639,19 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         [f"裁到镜头窗口 {trimmed} 镜（裁掉 {cut_ms}ms）"] if trimmed else []) + (
         [f"末帧定格补齐 {padded} 镜（{pad_ms}ms）"] if padded else []) + (
         [f"裁切失败 {trim_failed} 镜（原片段照常入库）"] if trim_failed else []) + (
-        [f"质检测量 {qc_measured} 镜（抽帧 + 客观量；判定在前端质检层）"] if qc_measured else [])
+        [f"质检测量 {qc_measured} 镜（抽帧 + 客观量；判定在前端质检层）"] if qc_measured else []) + (
+        [f"跳过 {summary.skipped} 镜（{'，'.join(skip_reasons)}）"] if summary.skipped else []) + (
+        [f"失败 {summary.failed} 镜（{'，'.join(fail_reasons)}）"] if summary.failed else [])
     return SkillOutput(
-        data=ImageToVideoData(clips=clips, warnings=warnings),
+        data=ImageToVideoData(
+            clips=clips, shots=list(statuses.values()), summary=summary, warnings=warnings),
         reasoning=[common.chain(
-            f"图生视频完成：{len(clips)}/{len(jobs) + len(reused_clips)} 镜出片（共 {total_ms}ms"
+            f"图生视频完成：{produced}/{summary.total} 镜出片"
+            f"（生成 {summary.generated} / 复用 {summary.reused}；共 {total_ms}ms"
             f"{'；' + '，'.join(extras) if extras else ''}）",
             causal_analysis=(
-                f"逐镜把素材图（预签名 URL）+ **画面提示词**喂 {cfg.videogen_model}（prompt 末尾统一追加"
-                "「不要出现文字/字幕/水印」的负向约束，ADR-073）；"
+                f"逐镜把素材图（**公网端点**预签名 URL，ADR-123）+ **画面提示词**喂 {cfg.videogen_model}"
+                "（prompt 末尾统一追加「不要出现文字/字幕/水印」的负向约束，ADR-073）；"
                 f"时长按镜头建议时长（{clips[0].durationMs}ms 等）原样下发；"
                 + ("相邻镜按**首尾帧桥**下发（首帧 = 本镜图、尾帧 = 下一镜图，ADR-074），"
                    "让切点处画面首尾咬合；" if bridged else "")
@@ -491,13 +669,14 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                 + "直链（24h）已转存为不可变 key。"
             ),
             risk_note=(
-                f"{failed} 镜未出片，render 侧将回落静图（如实标注）。"
-                if failed else
+                f"{fell_back_count} 镜未出片（逐镜原因见 shots[] 与 warnings），"
+                "render 侧将回落静图（如实标注）。"
+                if fell_back_count else
                 "全部镜头已出片；运镜已随本次生成落地（render 侧**不再**施加运镜——重复施加已退役）。"
             ),
         )],
-        confidence=1.0 if not failed else 0.6,
-        sample_size=len(clips),
-        degraded=bool(failed),
-        degradation_reason="partial-shots-failed" if failed else None,
+        confidence=1.0 if not fell_back_count else 0.6,
+        sample_size=produced,
+        degraded=bool(fell_back_count),
+        degradation_reason="partial-shots-fell-back" if fell_back_count else None,
     )

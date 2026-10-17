@@ -24,8 +24,13 @@
     真补 / `-an` 真丢音轨，并用 ffprobe 复核输出时长）
 
 mock 方式：替换 ``_dsp_video_gen`` 的 submit/wait（模块级薄适配层）与 ``_dsp_storage``
-的 presign/fetch/put_file，不需要网络 / 厂商密钥 / 对象存储。密钥用假值经 env 注入。
-``fetch_to_file`` **真写一张 PIL 图**（按文件名给尺寸）——故降采样是**真跑**而非假过。
+的 ``presign_get_public`` / ``probe_public_read`` / fetch/put_file，不需要网络 / 厂商密钥 /
+对象存储。密钥用假值经 env 注入。``fetch_to_file`` **真写一张 PIL 图**（按文件名给尺寸）——
+故降采样是**真跑**而非假过。
+
+**ADR-123**：6b（7b）段专验「输入素材公网可达性」——未配公网端点 / 端点字面内网 / HTTP 预检失败
+三种情况都必须**逐镜 skipped（source_url_unreachable）且零厂商提交**；逐镜状态 `shots[]` 与
+`summary` 同时断言（厂商失败记 `failed` / `vendor_generation_failed`，与前置失败可区分）。
 """
 
 from __future__ import annotations
@@ -110,8 +115,11 @@ def _install_fakes() -> None:
         _PUTS.append(key)
         return key
 
-    def presign_get(key: str, ttl_s: int | None = None) -> str:
+    def presign_get_public(key: str, ttl_s: int | None = None) -> str:
         return f"https://assets.example/{key}"
+
+    def probe_public_read(url: str, timeout_s: float = 8.0) -> tuple[bool, str]:
+        return True, ""
 
     def exists(key: str) -> bool:
         return key in _EXISTS
@@ -135,7 +143,8 @@ def _install_fakes() -> None:
     videogen.wait = wait
     storage.fetch_to_file = fetch_to_file
     storage.put_file = put_file
-    storage.presign_get = presign_get
+    storage.presign_get_public = presign_get_public
+    storage.probe_public_read = probe_public_read
     storage.exists = exists
     media.run_ffprobe = run_ffprobe
     media.run_ffmpeg = run_ffmpeg
@@ -238,17 +247,33 @@ def main() -> None:
     check("首尾帧桥" in r.reasoning[0].conclusion, "结论须如实说明用了首尾帧桥")
     check("dsp/scratch/t1/run-demo-8/clips/s1.mp4" in _PUTS, "直链须转存为不可变 key")
     check(r.metrics.degraded is False, "全出片不应标记降级")
+    # ADR-123：逐镜真实结局**结构化**带出（成功时含片段 key + runId），运行器据此判阶段进度
+    by_status = {s.shotId: s for s in r.data.shots}
+    check(by_status["s1"].status == "generated" and by_status["s2"].status == "generated",
+          "happy path：两镜状态都是 generated")
+    check(by_status["s1"].key.endswith("/clips/s1.mp4") and by_status["s1"].runId == "run-demo-8",
+          "success 带片段 key 与 runId（可回查产物）")
+    check(by_status["s1"].imageKey.endswith("门头1.jpg"),
+          "逐镜状态保留素材绑定关系（回落静图时也保留）")
+    check(r.data.summary.total == 2 and r.data.summary.generated == 2
+          and r.data.summary.skipped == 0 and r.data.summary.failed == 0,
+          "summary 按真实结局汇总（2/2 generated）")
 
     section("2) build_payload：有/无尾帧的两种提交体形状")
     cfg = load_config().dsp
     with_tail = videogen.build_payload(cfg, prompt="p", image_url="A", seconds="3",
                                        tail_image_url="B")
     without = videogen.build_payload(cfg, prompt="p", image_url="A", seconds="3")
-    print(f"  有尾帧    : image={with_tail['image']} images={with_tail['images']}")
-    print(f"  无尾帧    : image={without['image']} images={without['images']}")
+    print(f"  有尾帧    : {with_tail}")
+    print(f"  无尾帧    : {without}")
     check(with_tail["images"] == ["A", "B"] and with_tail["image"] == "A",
           "有尾帧 ⇒ images = [首帧, 尾帧]（第 2 位 = 尾帧）")
-    check(without["images"] == ["A"], "无尾帧 ⇒ images 只有首帧（与新增前一致）")
+    check("images" not in without and without["image"] == "A",
+          "无尾帧 ⇒ 只发 image（不再塞单元素 images）")
+    check(with_tail["duration"] == 3 and isinstance(with_tail["duration"], int),
+          "时长字段必须是 duration（整数秒）")
+    check(not ({"aspect_ratio", "quality", "seconds"} & set(with_tail)),
+          "不得再发 aspect_ratio / quality / seconds（非该接口字段，ADR-111）")
     check(videogen.parse_size("720x1280") == (720, 1280)
           and videogen.parse_size("720X1280") == (720, 1280)
           and videogen.parse_size("") == (0, 0) and videogen.parse_size("abc") == (0, 0),
@@ -278,9 +303,15 @@ def main() -> None:
     print(f"  degraded  : {r.metrics.degraded} / {r.metrics.degradation_reason}")
     print(f"  warnings  : {r.data.warnings}")
     check([c.shotId for c in r.data.clips] == ["s1"], "失败镜不出片段，成功的照常出片")
-    check(r.metrics.degraded and r.metrics.degradation_reason == "partial-shots-failed",
+    check(r.metrics.degraded and r.metrics.degradation_reason == "partial-shots-fell-back",
           "部分失败须如实标记降级")
     check(any("回落静图" in w for w in r.data.warnings), "失败镜须如实说明回落")
+    # ADR-123：**厂商调用失败**与前置条件失败的原因码不同（前者 vendor_*，后者 source_url_unreachable）
+    by_status = {s.shotId: s for s in r.data.shots}
+    check(by_status["s2"].status == "failed" and by_status["s2"].reason == "vendor_generation_failed",
+          "厂商侧失败记 failed / vendor_generation_failed（不是 skipped）")
+    check(r.data.summary.generated == 1 and r.data.summary.failed == 1,
+          "summary：1 生成 / 1 失败（不从 clips 反推）")
     _FAIL_SHOTS.clear()
 
     section("6) 成本闸：maxShots 限制生成镜数")
@@ -290,6 +321,9 @@ def main() -> None:
     print(f"  warnings  : {r.data.warnings}")
     check(len(r.data.clips) == 1 and r.data.clips[0].shotId == "s1", "maxShots=1 只生成首镜")
     check(any("maxShots" in w for w in r.data.warnings), "截断须如实说明")
+    max_status = {s.shotId: s for s in r.data.shots}
+    check(max_status["s2"].status == "skipped" and max_status["s2"].reason == "max_shots",
+          "被成本闸截断的镜记 skipped / max_shots（不是失败，也没提交厂商）")
 
     section("7) 降采样失败 → 回落原图并如实告警（画质风险，不丢镜）")
     _reset()
@@ -309,6 +343,51 @@ def main() -> None:
     check(not any("/i2v_input/" in k for k in _PUTS), "降采样失败 ⇒ 不落派生件")
     check(any("回落原图" in w for w in r.data.warnings), "降采样失败须**如实告警**（不静默）")
     check(len(r.data.clips) == 2, "降采样失败**不丢镜**（画质风险 ≠ 成片失败）")
+
+    section("7b) 公网输入前置检查（ADR-123）：未配公网端点 / 私网地址 / 预检失败 -> 逐镜 skipped，不提交厂商")
+
+    def _fake_presign_raises(key: str, ttl_s: int | None = None) -> str:
+        raise storage.DspStorageError(
+            "未配置公网对象存储端点 FLOWMIND_DSP_S3_PUBLIC_ENDPOINT",
+            category="environment", code="public_endpoint_unconfigured")
+
+    _reset()
+    storage.presign_get_public = _fake_presign_raises
+    r = invoke("image_to_video", _ctx())
+    print(f"  未配公网端点 → shots: {[(s.shotId, s.status, s.reason) for s in r.data.shots]}")
+    check(len(_SUBMITTED) == 0, "公网端点未配置 ⇒ **一次厂商提交都不发**（不浪费按镜计费）")
+    check(all(s.status == "skipped" and s.reason == "source_url_unreachable" for s in r.data.shots),
+          "逐镜记 skipped / source_url_unreachable（不是 failed）")
+    check(r.data.summary.skipped == 2 and r.metrics.degradation_reason == "all-shots-fell-back",
+          "全部跳过 ⇒ summary 如实计数，阶段不会标成完成")
+    check(r.data.clips == [], "不伪造片段")
+
+    def _fake_presign_private(key: str, ttl_s: int | None = None) -> str:
+        return f"http://127.0.0.1:9000/flowmind/{key}"
+
+    _reset()
+    storage.presign_get_public = _fake_presign_private
+    r = invoke("image_to_video", _ctx())
+    print(f"  私网端点 → shots: {[(s.shotId, s.status, s.reason) for s in r.data.shots]}")
+    check(len(_SUBMITTED) == 0, "公网端点字面内网 ⇒ 不提交厂商")
+    check(all(s.reason == "source_url_unreachable" for s in r.data.shots),
+          "内网预签名地址被识别为不适合给公网厂商（source_url_unreachable）")
+
+    _install_fakes()          # 恢复「公网签发」假件，只让**预检**失败
+    _reset()
+
+    def _probe_fails(url: str, timeout_s: float = 8.0) -> tuple[bool, str]:
+        return False, "HTTP 403（签名与公网 Host 不匹配，或反向代理未透传 Host）"
+
+    storage.probe_public_read = _probe_fails
+    r = invoke("image_to_video", _ctx())
+    print(f"  预检失败 → shots: {[(s.shotId, s.status, s.reason) for s in r.data.shots]}")
+    check(len(_SUBMITTED) == 0, "公网预检失败 ⇒ 不提交厂商（签名/反代问题提前暴露）")
+    check(all(s.reason == "source_url_unreachable" for s in r.data.shots),
+          "预检失败与厂商失败区分：前者 skipped / source_url_unreachable")
+    check(any("公网预检失败" in w for w in r.data.warnings),
+          "预检失败须如实告警并给出排查方向（Host / 签名）")
+    _install_fakes()          # 恢复
 
     section("8) 开关：关首尾帧桥 / 关输入降采样（env 覆盖）")
     os.environ["FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE"] = "0"
@@ -416,6 +495,9 @@ def main() -> None:
     check(s2_key in keys, "未列入 regenerateShotIds 且已有产物 ⇒ 直接复用该 key")
     check(len(_SUBMITTED) == 1, "只重生成被点名的那一镜（实际提交 %d 次）" % len(_SUBMITTED))
     check(any("复用" in w for w in r.data.warnings), "复用须如实说明（未重复出片 / 未重复计费）")
+    reuse_status = {s.shotId: s for s in r.data.shots}
+    check(reuse_status["s2"].status == "reused" and reuse_status["s2"].key == s2_key,
+          "复用的镜记 reused 并带出复用的 key（不是 generated）")
 
     # 12c) **质检测量侧**：qc 开关开 ⇒ 抽帧上传 + 客观量随片段带出；关 ⇒ 完全不抽不测
     _reset()

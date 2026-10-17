@@ -77,6 +77,13 @@ def main() -> int:
     print(f"  存储桶   FLOWMIND_DSP_S3_BUCKET   = {cfg.storage_bucket}（须与前端 /api/assets 同桶）")
     print(f"  存储区域 FLOWMIND_DSP_S3_REGION   = {cfg.storage_region or '(空 → 可空)'}")
     print(f"  明文传输 FLOWMIND_DSP_S3_SECURE   = {cfg.storage_secure}（MinIO 明文设 0）")
+    # ADR-123：图生视频厂商要求参考素材是公网 http(s)；没有公网入口 ⇒ 逐镜跳过（回落静图）。
+    from flowmind.skills import _dsp_storage as storage  # noqa: PLC0415  仅为判定公网入口
+    public = cfg.storage_public_endpoint or '(空 → 未配)'
+    print(f"  公网端点 FLOWMIND_DSP_S3_PUBLIC_ENDPOINT = {public}")
+    print("  图生视频公网入口 = "
+          + ("✅ 可用" if storage.public_presign_configured()
+             else "❌ 没有（图生视频会逐镜 skipped / 回落静图，步骤标 degraded）"))
     print(f"  配音音色 DspConfig.tts_default_speaker = {cfg.tts_default_speaker or '(空 → L1 待确认)'}")
     print(f"  渲染队列 FLOWMIND_DSP_MEDIAKIT_QUEUE_ID = {cfg.mediakit_queue_id or '(空 → 可空)'}")
     for name, expect in _PLAIN_ITEMS:
