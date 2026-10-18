@@ -375,6 +375,7 @@ _DSP_ENV_FIELDS: dict[str, str] = {
     "videogen_aspect_ratio": "FLOWMIND_DSP_VIDEOGEN_ASPECT_RATIO",
     "videogen_size": "FLOWMIND_DSP_VIDEOGEN_SIZE",
     "videogen_quality": "FLOWMIND_DSP_VIDEOGEN_QUALITY",
+    "bgm_track_key": "FLOWMIND_DSP_BGM_TRACK_KEY",
 }
 
 
@@ -542,6 +543,13 @@ class DspConfig(BaseModel):
     # 反代没透传 Host / 公网入口没通」，**不浪费按镜计费的厂商提交**。只证明「后端此刻读得到」，
     # 不承诺厂商网络一定能读——所以仍保留逐镜回落与如实状态。
     videogen_public_probe: bool = Field(default=True, validate_default=True)
+
+    # ── 背景音乐（ADR-126）──
+    # 当前**没有曲库 / 选曲接口**：`bgm_track_key` 为空 ⇒ bgm_match **如实降级**
+    # （badge=degraded + reason），成片静音回退，绝不返回「ok 的成功」。
+    # 运维可先把一首已入库的曲子 key 配进来（env FLOWMIND_DSP_BGM_TRACK_KEY），
+    # 技能会校验它在对象存储里**真的存在**再交给 render 混音；不做任何「猜一个曲目」。
+    bgm_track_key: str = Field(default="", validate_default=True)
 
     @field_validator(*_DSP_ENV_FIELDS, mode="before")
     @classmethod
