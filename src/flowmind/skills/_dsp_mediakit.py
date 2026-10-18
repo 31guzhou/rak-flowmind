@@ -430,6 +430,8 @@ def build_tracks(
             "extra": [{"type": "a_volume", "volume": 0.4}],
         }])
     if srt_url:
+        # 2026-10-18 真跑验证：整幅 canvas 的 transform（height=1920 / pos_y=0）**能把字幕
+        # 烧在底部**（取帧 + OCR 命中），故保持已验证形态，不再改动 box / 字体。
         tracks.append([{
             "type": "subtitle",
             "text": srt_url,

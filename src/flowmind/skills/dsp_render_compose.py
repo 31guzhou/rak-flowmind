@@ -262,13 +262,30 @@ def render_compose(inp: RenderComposeInput) -> SkillOutput[RenderComposeData]:
     warnings.extend(mediakit.transition_warnings(
         edl, set(clip_by_shot), region=cfg.mediakit_transition_region))
 
+    # **字幕 SRT 的引用形态**（ADR-126）：MediaKit 文档的 `subtitle.text` 是**URL**
+    # （示例为 `https://example.com/...srt`），不是 `mediakit://` 媒体引用。此前与其它素材
+    # 一样先上传再填 `mediakit://`，成片里**没有烧进字幕**（2026-10-18 真跑取帧 + OCR 实锤）。
+    # 优先用公网预签名 URL（SRT 很小，厂商可直接拉取）；公网端点不可用时退回上传，
+    # 并**如实告警**「厂商是否接受 mediakit:// 未验证」。
+    srt_key = str(subtitle.get("srtKey") or "")
+    srt_url = ""
+    if srt_key:
+        try:
+            srt_url = storage.presign_get_public(srt_key)
+            warnings.append("字幕 SRT 走公网预签名 URL（MediaKit 文档要求 subtitle.text 为 URL）")
+        except storage.DspStorageError as exc:
+            srt_url = ref(srt_key)
+            warnings.append(
+                f"字幕 SRT 公网预签名不可用（{exc}）——已上传 MediaKit 并以 mediakit:// 下发；"
+                "厂商是否接受该形态**未验证**，成片字幕可能不显示。")
+
     tracks = mediakit.build_tracks(
         edl,
         image_urls=image_urls,
         clip_urls=clip_urls,
         audio_url=ref(audio_key),
         bgm_url=ref(str(bgm.get("bgmKey") or "")),
-        srt_url=ref(str(subtitle.get("srtKey") or "")),
+        srt_url=srt_url,
         subtitle_font_size=inp.subtitleFontSize,
         canvas_width=cfg.mediakit_canvas_width,
         canvas_height=cfg.mediakit_canvas_height,

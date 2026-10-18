@@ -157,10 +157,15 @@ def main() -> None:
     check(_BODY["output"]["cover"]["cover_time"] == [0], "封面走 output.cover 抽帧")
     check(len(_BODY["track"][0]) == 2, "图片主轨两段")
     check(any("平台组件" in w for w in d.warnings), "商品链接不烧进画面须如实说明")
-    # 契约 §7.3① 的本地上传支：静图 / 音轨 / 字幕都先传字节，任务里只用 mediakit:// 引用
-    check(len(_UPLOADS) == 4, f"应上传 4 个素材（2 静图 + 1 音轨 + 1 字幕），实际 {len(_UPLOADS)}")
+    # 契约 §7.3① 的本地上传支：静图 / 音轨先传字节，任务里用 mediakit:// 引用。
+    # **字幕是例外**（ADR-126）：MediaKit 文档的 `subtitle.text` 是 URL（不是 mediakit://），
+    # 故 SRT 走公网预签名 URL，不再计入上传数。
+    subtitle_elem = next(e for e in _BODY["track"][2] if e["type"] == "subtitle")
+    check(len(_UPLOADS) == 3, f"应上传 3 个媒体素材（2 静图 + 1 音轨），实际 {len(_UPLOADS)}")
     check(all(u[0].startswith("dsp/scratch/") for u in _UPLOADS), "上传的是对象 key（字节），不是 URL")
     check(_BODY["track"][0][0]["source"].startswith("mediakit://"), "主轨素材须用 mediakit:// 引用")
+    check(subtitle_elem["text"].startswith("https://"),
+          f"字幕 SRT 必须以 URL 下发（MediaKit 文档），当前 {subtitle_elem['text'][:40]}")
     check(any("mediakit://" in w for w in d.warnings), "上传了几个素材须如实进 warnings")
 
     section("2) error：缺渲染密钥（abort 步）→ 明确报错，不伪造成片")
