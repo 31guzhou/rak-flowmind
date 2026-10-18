@@ -18,8 +18,12 @@ MediaKit（渲染）、豆包语音（配音）**不共享端点与密钥**—�
 ⚠️ **``seconds`` 取值「视模型而定」**（文档原话），**不保证连续整数**。本实现照
 镜头建议时长**原样下发**；厂商拒绝即抛结构化错误（不偷偷夹取 / 不编造时长）。
 
-⚠️ 聚合商请求字段里**没有**指南首尾帧用的 ``content.role``——本仓把**尾帧**放 ``images``
-数组第 2 位当「首尾帧桥」（ADR-074），这是**该接口面上最接近的落法**，语义**待真跑验证**。
+⚠️ **首尾帧必须走 ``metadata.content`` + ``role``**（ADR-126）。聚合商的公开文档只写
+``image`` / ``images``，但 new-api 的 Doubao 适配器把 ``images`` 转成上游 ``content`` 时
+**不写 role**，上游直接 400 ``role must be specified for image contents``（2026-10-18 真跑
+s1/s3 即此）。现行请求体：顶层 ``prompt`` / ``duration`` / ``size`` + ``metadata.content``
+（text + ``first_frame`` + ``last_frame``）/ ``metadata.resolution`` / ``metadata.ratio``。
+``metadata.content`` 会整段替换适配器拼出的 content，故文本也一并放进去。
 
 ⚠️ **运镜（ADR-076）**：本聚合端点**没有任何运动入参**（请求体只有 model/prompt/aspect_ratio/
 size/seconds/quality/image/images）。故运镜**只能经提示词语言**表达——`motion_expression()`
@@ -208,20 +212,56 @@ def duration_value(seconds: str) -> int:
     return max(1, int(round(value)))
 
 
+def _resolution_of(size: str) -> str:
+    """``720x1280`` → 上游分辨率档位 ``720p``（Seedance 认小写档位）。"""
+    w, h = parse_size(size)
+    longest = max(w, h)
+    if longest >= 1920:
+        return "1080p"
+    if longest >= 1280:
+        return "720p"
+    return "480p"
+
+
+def _ratio_of(size: str) -> str:
+    """``720x1280`` → ``9:16``；认不出的形状交给上游自适应。"""
+    w, h = parse_size(size)
+    if not (w and h):
+        return "adaptive"
+    if w == h:
+        return "1:1"
+    ratio = w / h
+    if abs(ratio - 9 / 16) < 0.01:
+        return "9:16"
+    if abs(ratio - 16 / 9) < 0.01:
+        return "16:9"
+    return "adaptive"
+
+
 def build_payload(
     cfg: DspConfig, *, prompt: str, image_url: str, seconds: str, tail_image_url: str = "",
     motion_params: dict[str, object] | None = None,
 ) -> dict:
-    """按**当前**接口组装提交体（2026-10-17 真调更正，见 ADR-111）。
+    """按**当前**接口组装提交体（ADR-111 真调 + ADR-126 首尾帧协议收口）。
 
-    ``image`` = 首帧参考素材；``tail_image_url`` 非空时再放进 ``images`` 第 2 位 =
-    **首尾帧桥**（ADR-074）——数组形态在新模型上**尚未真跑验证**，厂商若忽略则退化为单图（无错误画面）。
+    **统一图生视频与首尾帧桥**：只要带图，就走同一条 ``metadata.content``：
+
+    ```json
+    {"type": "image_url", "image_url": {"url": "..."}, "role": "first_frame"}
+    {"type": "image_url", "image_url": {"url": "..."}, "role": "last_frame"}
+    ```
+
+    为什么不能再用顶层 ``image`` / ``images``：new-api 的 Doubao 适配器把 ``images``
+    转成上游 ``content`` 时**不写 role**，上游直接 400
+    ``role must be specified for image contents``（2026-10-18 真跑 s1/s3 即此）。
+    ``metadata.content`` 会被适配器**整段替换**进上游 content，因此文本也一并放进去；
+    顶层 ``prompt`` 保留（网关校验与计费要读）。
 
     ``motion_params`` = **运镜的引擎参数位**（ADR-076）。本聚合端点**没有**运动字段，故
-    ``motion_expression()`` 当前恒返回空 dict、这里**一个键都不会并进去**（空即不传，不编造厂商参数）。
+    ``motion_expression()`` 当前恒返回空 dict、这里**一个键都不会并进去**（空即不传）。
 
-    ⚠️ **不注入** ``aspect_ratio`` / ``quality`` / ``seconds``：它们不属于该视频接口的字段，
-    真调会诱发上游 ``invalid_request``（ADR-111）。比例由 ``size`` 表达、时长用 ``duration``。
+    ⚠️ **不注入** ``aspect_ratio`` / ``quality`` / ``seconds``：非该视频接口字段，真调会诱发
+    上游 ``invalid_request``（ADR-111）。比例用 ``metadata.ratio``、时长用 ``duration``。
     """
     payload: dict = {
         "model": cfg.videogen_model,
@@ -230,14 +270,89 @@ def build_payload(
         "size": cfg.videogen_size,
     }
     if image_url:
-        payload["image"] = image_url
-        if tail_image_url and tail_image_url != image_url:
-            refs = [image_url, tail_image_url]
-            payload["images"] = refs[: max(1, cfg.videogen_max_ref_images)]
+        has_tail = bool(tail_image_url and tail_image_url != image_url)
+        content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": image_url},
+            "role": "first_frame",
+        })
+        if has_tail:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": tail_image_url},
+                "role": "last_frame",
+            })
+        # 首尾帧模式官方建议 adaptive：按两张图的真实画幅自适应，减少跳帧；
+        # 单图仍按输出尺寸锁 9:16（成片是竖屏）。
+        payload["metadata"] = {
+            "content": content,
+            "resolution": _resolution_of(cfg.videogen_size),
+            "ratio": "adaptive" if has_tail else _ratio_of(cfg.videogen_size),
+        }
     # 运镜参数位（ADR-076）：**空即不传**——本引擎为空，不往请求体里塞不认识的自造字段
     if motion_params:
         payload.update({k: v for k, v in motion_params.items() if k not in payload})
     return payload
+
+
+def validate_payload(payload: dict) -> list[str]:
+    """提交前的**本地协议预检**（不发请求、不花钱）。
+
+    返回空列表 = 通过；否则是逐条问题。重点挡住 2026-10-18 真跑的那类错误：
+    图片 content 缺 ``role``、首帧/尾帧顺序颠倒、URL 非 http(s)。
+    """
+    problems: list[str] = []
+    if not str(payload.get("model") or "").strip():
+        problems.append("缺少 model")
+    if not str(payload.get("prompt") or "").strip():
+        problems.append("缺少 prompt")
+    duration = payload.get("duration")
+    if not isinstance(duration, int) or duration < 1:
+        problems.append(f"duration 必须是 ≥1 的整数（当前 {duration!r}）")
+    meta = payload.get("metadata")
+    if meta is None:
+        return problems
+    if not isinstance(meta, dict):
+        problems.append("metadata 必须是对象")
+        return problems
+    content = meta.get("content")
+    if not isinstance(content, list):
+        problems.append("metadata.content 必须是数组")
+        return problems
+    roles: list[str] = []
+    for index, item in enumerate(content):
+        if not isinstance(item, dict):
+            problems.append(f"metadata.content[{index}] 不是对象")
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            if not str(item.get("text") or "").strip():
+                problems.append(f"metadata.content[{index}] 文本为空")
+            continue
+        if kind != "image_url":
+            problems.append(f"metadata.content[{index}] 未知类型 {kind!r}")
+            continue
+        image = item.get("image_url")
+        url = str((image or {}).get("url") if isinstance(image, dict) else "")
+        role = str(item.get("role") or "")
+        if not url.startswith(("http://", "https://", "asset://")):
+            problems.append(f"metadata.content[{index}] 图片 URL 不是 http(s)/asset://")
+        if role not in ("first_frame", "last_frame", "reference_image"):
+            problems.append(
+                f"metadata.content[{index}] 图片必须带 role（first_frame/last_frame/reference_image），"
+                f"当前 {role!r}")
+        roles.append(role)
+    image_roles = [r for r in roles if r]
+    if image_roles.count("first_frame") > 1:
+        problems.append("first_frame 只能有一张")
+    if image_roles.count("last_frame") > 1:
+        problems.append("last_frame 只能有一张")
+    if "last_frame" in image_roles and "first_frame" not in image_roles:
+        problems.append("有 last_frame 时必须同时有 first_frame")
+    if image_roles and image_roles[0] != "first_frame":
+        problems.append("第一张图必须是 first_frame")
+    return problems
 
 
 def submit(
