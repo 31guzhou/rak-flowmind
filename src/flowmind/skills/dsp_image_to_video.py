@@ -7,10 +7,18 @@
 **prompt 取画面提示词、不是台词**（ADR-073）：把口播文案当画面提示词会让模型把**字幕烧进画面**，
 故优先用 ``edl.shots[].visualPrompt``（``copy`` 只在缺画面提示词时兜底，并**如实告警**）。
 
-**首尾帧桥**（ADR-074）：逐镜把**下一镜的图**当**尾帧**下发（``images`` 数组第 2 位）——
+**首尾帧桥**（ADR-074 / ADR-126）：逐镜把**下一镜的图**当**尾帧**下发——
 相邻镜在画面里首尾咬合，取代「厂商转场资源 ID 未登记 ⇒ 一律硬切」。开关
-``FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE=0`` 可关（聚合商未透出指南的 ``content.role``，
-本落法语义**待真跑验证**）。
+``FLOWMIND_DSP_VIDEOGEN_BRIDGE_NEXT_IMAGE=0`` 可关。**协议**：首帧 / 尾帧统一放进
+``metadata.content`` 并带 ``role``（``first_frame`` / ``last_frame``）；顶层 ``images``
+会被 new-api 的 Doubao 适配器转成**无 role** 的 content，上游直接 400
+``role must be specified for image contents``（2026-10-18 真跑 s1/s3 实锤）。
+
+**诊断与恢复**（ADR-126）：提交前本地协议预检；逐镜记录厂商 task id / request id / 尝试次数 /
+错误分类 / 脱敏原文；首个鉴权/权限类 403 **暂停同批剩余提交**；``preflightOnly`` 只提交第一镜做
+单镜头预检。成片直链 403 时回退带 Bearer 的 ``GET /v1/videos/{task_id}/content``
+（``downloadVia`` 留痕）。``skipExisting``：恢复运行时已有片段一律复用（即使列在
+``regenerateShotIds`` 里），只补缺失镜——不重复生成已验证合格的片段。
 
 **输入降采样**（ADR-074）：素材图（补生 ``1152x2048``，为**静图主轨**口径）在**下发前**等比缩到
 不超过 I2V 输出分辨率（``videogen_size``）——指南 FAQ：输入超过输出分辨率易出**指纹状纹理**。
@@ -79,6 +87,17 @@ class ImageToVideoInput(DspBaseInput):
         default_factory=list,
         description="**只重生成这些镜**（ADR-079 的按镜重试 / 换图重生成）：未列出的镜头若在确定性 key "
                     "上已有产物则**复用**（不重复出片、不重复计费）；**留空 = 全部重新生成**（正常首跑）")
+    skipExisting: bool = Field(
+        default=False,
+        description="**恢复运行**（ADR-126）：确定性 key 上已有片段的镜头一律复用，只生成缺失镜。"
+                    "与 `regenerateShotIds` 同时给出时 **skipExisting 优先**（恢复不得覆盖已验证合格的产物）。")
+    preflightOnly: bool = Field(
+        default=False,
+        description="**单镜头预检**：只提交第一镜并等它创建任务，验证鉴权 / 请求协议通过即返回；"
+                    "其余镜记 skipped（reason=preflight_only），不提交厂商、不计费。")
+    stopOnAuthError: bool = Field(
+        default=True,
+        description="第一个明确的鉴权/权限类失败（HTTP 401/403）出现时暂停同批剩余镜头提交（ADR-126）。")
 
 
 class ShotClip(BaseModel):
@@ -119,13 +138,26 @@ class ShotVideoStatus(BaseModel):
     reason: str = Field(
         default="",
         description="稳定原因码：source_url_unreachable / no_image / no_prompt / max_shots / "
-                    "reused_existing / vendor_submit_failed / vendor_generation_failed / transfer_failed")
+                    "reused_existing / vendor_submit_failed / vendor_auth_failed / "
+                    "vendor_generation_failed / transfer_failed / preflight_only / batch_aborted")
     detail: str = Field(default="", description="给人看的原因（**不含预签名 URL 查询串**）")
     key: str = Field(default="", description="片段对象 key（generated / reused 时非空）")
     runId: str = Field(default="", description="产出该片段的运行 id（与 key 命名空间一致）")
     atMs: int = 0
     durationMs: int = 0
     imageKey: str = Field(default="", description="本镜绑定的素材 key（回落静图时保留绑定关系）")
+    tailImageKey: str = Field(default="", description="首尾帧桥的尾帧素材 key（空 = 单图下发）")
+    providerTaskId: str = Field(default="", description="厂商任务 id（**提交成功后才非空**）")
+    providerRequestId: str = Field(default="", description="厂商/网关请求 id（诊断用；空 = 未提供）")
+    attempts: int = Field(default=0, ge=0, description="本镜提交尝试次数（含重试；0 = 未提交）")
+    errorCategory: str = Field(
+        default="",
+        description="失败分类（environment / transient / video / transfer）；成功为空")
+    errorCode: str = Field(default="", description="厂商错误码（原始，不含凭证）")
+    rawExcerpt: str = Field(
+        default="", description="失败时脱敏后的原始响应摘录（空 = 没有响应体）；**不含加密 URL**")
+    downloadVia: str = Field(
+        default="", description="成片下载通道：direct（厂商直链）/ proxy（鉴权代理）；失败为空")
 
 
 class VideoStatusSummary(BaseModel):
@@ -167,6 +199,18 @@ def _presign_public(key: str) -> str:
     URL——必须由**公网端点**签发（ADR-123）。未配置公网入口时抛 ``DspStorageError``。
     """
     return storage.presign_get_public(key) if key else ""
+
+
+def _should_reuse(
+    exists: bool, shot_id: str, regenerate_ids: set[str], skip_existing: bool,
+) -> bool:
+    """该镜是否复用确定性 key 上的已有片段（**恢复幂等**的单一判据，ADR-126）。
+
+    - `skip_existing=True`（恢复运行）：存在就复用——**即使它在 regenerateShotIds 里**，
+      也不覆盖已验证合格的产物；
+    - 否则：只有「不在重生成清单里」的镜才复用（ADR-079 的按镜重试语义）。
+    """
+    return exists and (skip_existing or shot_id not in regenerate_ids)
 
 
 def _next_image_key(shots: list[common.DspEdlShot], idx: int) -> str:
@@ -306,16 +350,32 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     statuses: dict[str, ShotVideoStatus] = {}
 
     def _mark(shot_id: str, status: ShotVideoStatusId, *, reason: str = "", detail: str = "",
-              key: str = "", at_ms: int = 0, duration_ms: int = 0, image_key: str = "") -> None:
+              key: str = "", at_ms: int = 0, duration_ms: int = 0, image_key: str = "",
+              tail_image_key: str = "", provider_task_id: str = "", provider_request_id: str = "",
+              attempts: int = 0, error_category: str = "", error_code: str = "",
+              raw_excerpt: str = "", download_via: str = "") -> None:
         statuses[shot_id] = ShotVideoStatus(
             shotId=shot_id, status=status, reason=reason, detail=detail,
             key=key, runId=inp.runId if key else "",
-            atMs=at_ms, durationMs=duration_ms, imageKey=image_key)
+            atMs=at_ms, durationMs=duration_ms, imageKey=image_key,
+            tailImageKey=tail_image_key, providerTaskId=provider_task_id,
+            providerRequestId=provider_request_id, attempts=attempts,
+            errorCategory=error_category, errorCode=error_code,
+            rawExcerpt=raw_excerpt, downloadVia=download_via)
 
     def _mark_job(job: _Job, status: ShotVideoStatusId, *, reason: str = "", detail: str = "",
-                  key: str = "") -> None:
+                  key: str = "", attempts: int = 0, provider_task_id: str = "",
+                  provider_request_id: str = "", exc: videogen.DspVideoGenError | None = None,
+                  download_via: str = "") -> None:
         _mark(job.shot_id, status, reason=reason, detail=detail, key=key,
-              at_ms=job.at_ms, duration_ms=job.duration_ms, image_key=job.image_key)
+              at_ms=job.at_ms, duration_ms=job.duration_ms,
+              image_key=job.image_key, tail_image_key=job.tail_key,
+              provider_task_id=provider_task_id, provider_request_id=provider_request_id,
+              attempts=attempts,
+              error_category=(exc.category if exc else ""),
+              error_code=(exc.code if exc else ""),
+              raw_excerpt=(exc.raw_excerpt if exc else ""),
+              download_via=download_via)
 
     def _summary() -> VideoStatusSummary:
         values = list(statuses.values())
@@ -423,26 +483,31 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                                     risk_note="各镜缺图或缺文案；请补齐素材/文案后重跑。")],
             confidence=0.0, degraded=True, degradation_reason="no-generatable-shots")
 
-    # ── 按镜重生成（ADR-079）：`regenerateShotIds` 之外的镜头，若确定性 key 上已有产物就**复用** ──
+    # ── 按镜重生成（ADR-079）/ 恢复运行（ADR-126）：确定性 key 上已有产物就**复用** ──
     # 用法：前端质检/调度层发现某镜没过，换图后只把该镜交给本步重跑；其余镜的产物原样带出，
-    # **不重复出片、不重复计费**。`regenerateShotIds` 为空 = 正常首跑（全部生成）。
+    # **不重复出片、不重复计费**。`regenerateShotIds` 为空且 `skipExisting=false` = 正常首跑（全部生成）。
+    #
+    # **恢复运行**（`skipExisting=true`）的幂等约束：已有片段一律复用，**即使它出现在
+    # `regenerateShotIds` 里**——恢复不得覆盖已验证合格的产物；只有 key 上确实没有片段的镜才生成。
     regen = set(inp.regenerateShotIds)
     reused_clips: list[ShotClip] = []
-    if regen:
+    if regen or inp.skipExisting:
         to_generate: list[_Job] = []
         for job in jobs:
             key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
-            if job.shot_id not in regen and storage.exists(key):
+            reuse = _should_reuse(storage.exists(key), job.shot_id, regen, inp.skipExisting)
+            if reuse:
                 reused_clips.append(ShotClip(
                     shotId=job.shot_id, key=key, atMs=job.at_ms, durationMs=job.duration_ms))
                 _mark_job(job, "reused", reason="reused_existing",
-                          detail="确定性 key 上已有片段，按 ADR-079 复用（未重新出片、未重复计费）",
+                          detail="确定性 key 上已有片段，按 ADR-079/126 复用（未重新出片、未重复计费）",
                           key=key)
             else:
                 to_generate.append(job)
         if reused_clips:
             warnings.append(
-                f"按镜重生成：{len(reused_clips)} 镜**复用**已有片段（未重新出片、未重复计费）；"
+                f"{'恢复运行' if inp.skipExisting else '按镜重生成'}："
+                f"{len(reused_clips)} 镜**复用**已有片段（未重新出片、未重复计费）；"
                 f"本次只生成 {len(to_generate)} 镜")
         jobs = to_generate
     if not jobs and not reused_clips:
@@ -453,11 +518,11 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                                     risk_note="各镜缺图或缺文案；请补齐素材/文案后重跑。")],
             confidence=0.0, degraded=True, degradation_reason="no-generatable-shots")
 
-    # ── 先全部提交（厂商侧并行跑），再逐个等 ──
+    # ── 备料 → **单镜头预检** → 批量提交（ADR-126）──────────────────────────
     # 素材图在这时才逐张准备（降采样要下载+缩放+转存，只对**真要生成的镜**做）。
     url_cache: dict[str, tuple[str, str]] = {}
     stats = {"downscaled": 0}
-    submitted: list[tuple[_Job, str]] = []
+    prepared: list[tuple[_Job, str, str]] = []
     for job in jobs:
         image_url, prepare_reason = _i2v_image_url(
             inp, cfg, job.image_key, cap, url_cache, warnings, stats)
@@ -475,17 +540,46 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                 warnings.append(
                     f"镜头 {job.shot_id} 的尾帧素材不可用（{tail_reason or 'source_url_unreachable'}）"
                     "——本镜**按单图下发**（不因尾帧失败丢整镜）")
-        # **有界重试**（ADR-079）：厂商把错误分成了 transient/其它（`DspVideoGenError.retriable`），
-        # 而此前这个标志**被丢掉了**——瞬时抖动也直接判该镜回落静图，白白浪费一镜的配额。
-        # 只对 `retriable` 重试，最多 `_SUBMIT_ATTEMPTS` 次；其余错误立刻如实报出（不无脑重试）。
+        prepared.append((job, image_url, tail_url))
+
+    submitted: list[tuple[_Job, str, str, int]] = []
+    auth_aborted = False
+    for index, (job, image_url, tail_url) in enumerate(prepared):
+        if auth_aborted and inp.stopOnAuthError:
+            _mark_job(job, "skipped", reason="batch_aborted",
+                      detail="同批更早的镜头出现鉴权/权限类失败（HTTP 401/403）——"
+                             "已暂停剩余提交，避免无意义重试与重复费用")
+            warnings.append(
+                f"镜头 {job.shot_id} **未提交**：同批已出现鉴权/权限类失败，按 ADR-126 暂停剩余提交")
+            continue
+        if inp.preflightOnly and index > 0:
+            _mark_job(job, "skipped", reason="preflight_only",
+                      detail="单镜头预检模式：只提交第一镜验证鉴权/协议，其余未提交（未计费）")
+            continue
+
+        attempts = 0
         task_id = ""
+        request_id = ""
         last: videogen.DspVideoGenError | None = None
+        # **单镜头预检**：第一镜的提交本身就是权限 / 协议探针；它失败为鉴权/权限类时，
+        # 后面的镜头一次都不发（不浪费配额，也不掩盖根因）。
+        if index == 0:
+            warning = (
+                f"[dsp] video 预检：单镜头提交 shot={job.shot_id}"
+                f"（{'首尾帧' if tail_url else '单图'} · {job.seconds}s）…")
+            warnings.append(warning)
+            print(warning, flush=True)
+        # **有界重试**（ADR-079）：厂商把错误分成了 transient/其它（`DspVideoGenError.retriable`），
+        # 只对 `retriable` 重试，最多 `_SUBMIT_ATTEMPTS` 次；403 / 400 等立刻如实报出（不无脑重试）。
         for attempt in range(1, _SUBMIT_ATTEMPTS + 1):
+            attempts = attempt
             try:
-                task_id = videogen.submit(
+                task_id, request_id = videogen.submit_with_meta(
                     cfg, prompt=job.prompt, image_url=image_url,
                     seconds=job.seconds, tail_image_url=tail_url,
-                    motion_params=job.motion_params)
+                    motion_params=job.motion_params,
+                    context={"shotId": job.shot_id,
+                             "attemptId": f"{inp.idempotencyKey or inp.runId}:{job.shot_id}"})
                 break
             except videogen.DspVideoGenError as exc:
                 last = exc
@@ -497,9 +591,23 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
             exc = last
             detail = f"（{exc.category}）：{exc}" if exc else "未知原因"
             warnings.append(f"镜头 {job.shot_id} 提交失败（{detail}）——该镜回落静图")
-            _mark_job(job, "failed", reason="vendor_submit_failed", detail=detail)
+            _mark_job(
+                job, "failed",
+                reason="vendor_auth_failed" if (exc and exc.global_permission) else "vendor_submit_failed",
+                detail=detail, attempts=attempts, exc=exc,
+                provider_request_id=(exc.request_id if exc else ""))
+            if exc and exc.global_permission and inp.stopOnAuthError:
+                auth_aborted = True
+                warnings.append(
+                    "检测到鉴权/权限类失败（HTTP "
+                    f"{exc.status or '?'}）：**暂停同批剩余镜头提交**。"
+                    "请先核查密钥 / 模型权限 / 渠道配额 / 端点 / IP 白名单，"
+                    "再跑单镜头预检（preflightOnly）确认；不要批量重试 403。")
             continue
-        submitted.append((job, task_id))
+        submitted.append((job, task_id, request_id, attempts))
+        _mark_job(job, "skipped", reason="not_attempted", detail="已提交厂商，等待出片",
+                  attempts=attempts, provider_task_id=task_id,
+                  provider_request_id=request_id)
 
     # ── 收片 → 裁到镜头窗口（ADR-080） → 转存 → （qc 开时）抽帧 + 客观量 ──
     clips: list[ShotClip] = list(reused_clips)
@@ -510,30 +618,52 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     pad_ms = 0         # 共补齐多少 ms
     short_unpadded: list[str] = []   # 比窗口短但**未补**（`freeze_pad` 关）的镜
     trim_failed = 0
-    for job, task_id in submitted:
+    for job, task_id, submit_request_id, submit_attempts in submitted:
         frames: list[str] = []
         frame_stats: dict[str, Any] = {}
         trim = common.DspEditTrim()
         key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
         # ① **厂商侧**：轮询到终态。失败与「前置检查不通过」分开记（reason 不同）。
+        poll_request_id = submit_request_id
         try:
-            raw = videogen.wait(cfg, task_id)
+            raw, poll_request_id = videogen.wait_with_meta(
+                cfg, task_id,
+                context={"shotId": job.shot_id,
+                         "attemptId": f"{inp.idempotencyKey or inp.runId}:{job.shot_id}"})
         except videogen.DspVideoGenError as exc:
             detail = f"（{exc.category}）：{exc}"
             warnings.append(f"镜头 {job.shot_id} 出片失败{detail}——该镜回落静图")
-            _mark_job(job, "failed", reason="vendor_generation_failed", detail=detail)
+            _mark_job(job, "failed", reason="vendor_generation_failed", detail=detail,
+                      provider_task_id=task_id, attempts=submit_attempts,
+                      provider_request_id=(exc.request_id or poll_request_id), exc=exc)
             continue
         url = videogen.result_url(raw)
         if not url:
             detail = "厂商任务完成但缺少视频直链（metadata.url / url）"
             warnings.append(f"镜头 {job.shot_id} 出片失败：{detail}——该镜回落静图")
-            _mark_job(job, "failed", reason="vendor_generation_failed", detail=detail)
+            _mark_job(job, "failed", reason="vendor_generation_failed", detail=detail,
+                      provider_task_id=task_id, attempts=submit_attempts,
+                      provider_request_id=poll_request_id)
             continue
         # ② **本仓侧**：下载 → 裁到窗口 → 转存 →（qc 开时）抽帧。任何一步失败都记 transfer_failed，
         # 与厂商失败区分开（排查方向不同：一个是配额/提示词，一个是存储/转存）。
+        download_via = ""
         try:
             with tempfile.TemporaryDirectory(prefix="dsp-i2v-") as tmp:
-                local = storage.fetch_to_file(url, str(Path(tmp) / f"{job.shot_id}.mp4"))
+                # 厂商直链可能 403（TOS AccessDenied）；`fetch_result` 会回退到带 Bearer 的
+                # `/v1/videos/{task_id}/content`（ADR-126，2026-10-18 真跑取证）。
+                try:
+                    local, download_via = videogen.fetch_result(
+                        cfg, task_id, url, str(Path(tmp) / f"{job.shot_id}.mp4"),
+                        context={"shotId": job.shot_id,
+                                 "attemptId": f"{inp.idempotencyKey or inp.runId}:{job.shot_id}"})
+                except videogen.DspVideoGenError as exc:
+                    warnings.append(
+                        f"镜头 {job.shot_id} 成片下载失败（{exc.category}）：{exc}——该镜回落静图")
+                    _mark_job(job, "failed", reason="transfer_failed", detail=f"（{exc.category}）：{exc}",
+                              provider_task_id=task_id, attempts=submit_attempts,
+                              provider_request_id=(exc.request_id or poll_request_id), exc=exc)
+                    continue
                 # **裁到镜头窗口**（ADR-080）：模型给的时长与 timeline 锁定的窗口不是同一个数——
                 # 超长会顶到下一镜、不足会让该镜提前卡住。失败**回落原片段 + 如实告警，不丢镜**
                 # （与输入降采样同款纪律：画质/节奏风险 ≠ 成片失败）。
@@ -580,12 +710,16 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                             f"镜头 {job.shot_id} 抽帧/测量失败（{exc}）——本次不做客观量（如实跳过）")
         except (storage.DspStorageError, media.MediaError) as exc:
             warnings.append(f"镜头 {job.shot_id} 转存/裁切失败：{exc}——该镜回落静图")
-            _mark_job(job, "failed", reason="transfer_failed", detail=str(exc))
+            _mark_job(job, "failed", reason="transfer_failed", detail=str(exc),
+                      provider_task_id=task_id, provider_request_id=poll_request_id,
+                      attempts=submit_attempts, error_category="transfer")
             continue
         clips.append(ShotClip(shotId=job.shot_id, key=key, atMs=job.at_ms,
                               durationMs=job.duration_ms, frames=frames,
                               frameStats=frame_stats, trim=trim))
-        _mark_job(job, "generated", key=key)
+        _mark_job(job, "generated", key=key, provider_task_id=task_id,
+                  provider_request_id=poll_request_id, attempts=submit_attempts,
+                  download_via=download_via)
 
     if trimmed or padded:
         bits: list[str] = []
