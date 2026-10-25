@@ -33,11 +33,13 @@ size/seconds/quality/image/images）。故运镜**只能经提示词语言**表�
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
+import socket
 import time
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -74,6 +76,51 @@ _REQUEST_ID_HEADERS = (
     "x-tos-request-id", "x-amz-request-id", "x-volc-request-id",
 )
 _URL_QUERY_RE = re.compile(r"(https?://[^\s\"'<>]+)\?[^\s\"'<>]*")
+
+# 下载重定向跳数上限（逐跳校验，见 ``_non_public_target``）。
+_MAX_DOWNLOAD_HOPS = 3
+# 显式拒绝的内网主机名（IP 形态由 ipaddress 判定）。
+_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata", "metadata.google.internal"})
+
+
+def _non_public_target(target: str) -> str:
+    """校验下载地址是否指向公网：通过返回空串，否则返回拒绝原因。
+
+    厂商完成态响应里的 ``metadata.url`` / ``url`` 属**外部输入**：不校验就等于把后端
+    当免费代理去打内网（云厂商元数据 ``169.254.169.254``、集群内 MinIO/Harbor、
+    ``127.0.0.1`` 上的 sidecar），取回的内网对象还会被转存成 key 回给前端（SSRF + 外带）。
+
+    ⚠️ 已知局限：DNS 校验与实际建连之间仍存在 rebinding 窗口（除非在 socket 层钉 IP）；
+    这里只做**域名/IP 层**的最小防线，够挡「厂商响应被污染」这一类，挡不住主动 rebinding。
+    """
+    try:
+        parts = urlsplit(target)
+    except ValueError as exc:
+        return f"地址无法解析（{exc}）"
+    if parts.scheme not in ("http", "https"):
+        return f"不支持的协议 {parts.scheme or '-'}"
+    host = parts.hostname
+    if not host:
+        return "缺少主机名"
+    if host.lower().rstrip(".") in _INTERNAL_HOSTNAMES:
+        return f"内网主机名 {host}"
+    try:
+        infos = socket.getaddrinfo(
+            host, parts.port or (443 if parts.scheme == "https" else 80),
+            proto=socket.IPPROTO_TCP,
+        )
+    except socket.gaierror as exc:
+        return f"域名解析失败 {host}（{exc}）"
+    for info in infos:
+        addr = str(info[4][0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return f"解析结果非法 {addr}"
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            return f"目标是内网地址 {addr}"
+    return ""
 
 
 def _redact_url(url: str) -> str:
@@ -725,56 +772,85 @@ def fetch_result(
     def _try_get(target: str, headers: dict, label: str) -> bool:
         nonlocal last_status, last_request_id, last_excerpt
         started = time.monotonic()
+        resp: requests.Response | None = None
         try:
-            resp = requests.get(target, headers=headers, stream=True,
-                                timeout=cfg.videogen_timeout_s * 4)
+            # ① 逐跳校验：每一跳（含 3xx 的 Location）都必须是公网地址，见 _non_public_target
+            current = target
+            for hop in range(_MAX_DOWNLOAD_HOPS + 1):
+                blocked = _non_public_target(current)
+                if blocked:
+                    failures.append(f"{label} 下载地址被拒绝：{blocked}")
+                    logger.warning(
+                        "[videogen] 下载地址被拒绝 channel=%s hop=%d host=%s shot=%s why=%s",
+                        label, hop, urlsplit(current).netloc or "-", ctx.get("shotId", "-"), blocked,
+                    )
+                    return False
+                resp = requests.get(current, headers=headers, stream=True, allow_redirects=False,
+                                    timeout=cfg.videogen_timeout_s * 4)
+                location = resp.headers.get("location")
+                if resp.is_redirect and hop < _MAX_DOWNLOAD_HOPS and location:
+                    resp.close()
+                    resp = None
+                    current = urljoin(current, location)
+                    continue
+                break
+            if resp is None:
+                failures.append(f"{label} 重定向超过 {_MAX_DOWNLOAD_HOPS} 跳")
+                return False
+            elapsed = time.monotonic() - started
+            last_status = resp.status_code
+            last_request_id = _request_id_of(resp.headers) or last_request_id
+            if not resp.ok:
+                raw = _raw_text_of(resp)
+                last_excerpt = sanitize_text(raw)
+                failures.append(f"{label} HTTP {resp.status_code}：{last_excerpt or '响应体为空'}")
+                logger.warning(
+                    "[videogen] 下载失败 channel=%s status=%s requestId=%s elapsed=%.2fs shot=%s raw=%r",
+                    label, resp.status_code, last_request_id or "-", elapsed,
+                    ctx.get("shotId", "-"), last_excerpt,
+                )
+                return False
+            content_type = str(resp.headers.get("content-type") or "").lower()
+            if content_type.startswith(("text/", "application/json")):
+                raw = _raw_text_of(resp)
+                last_excerpt = sanitize_text(raw)
+                failures.append(f"{label} 返回的不是视频（{content_type}）：{last_excerpt or '响应体为空'}")
+                logger.warning(
+                    "[videogen] 下载失败 channel=%s status=%s content-type=%s shot=%s raw=%r",
+                    label, resp.status_code, content_type or "-", ctx.get("shotId", "-"), last_excerpt,
+                )
+                return False
+            written = 0
+            with open(dest_path, "wb") as out:
+                for chunk in resp.iter_content(1 << 20):
+                    if chunk:
+                        out.write(chunk)
+                        written += len(chunk)
+            if written == 0:
+                failures.append(f"{label} 返回空文件（HTTP {resp.status_code}）")
+                logger.warning(
+                    "[videogen] 下载失败 channel=%s status=%s 空文件 shot=%s",
+                    label, resp.status_code, ctx.get("shotId", "-"),
+                )
+                return False
+            logger.info(
+                "[videogen] 下载完成 channel=%s status=%s requestId=%s elapsed=%.2fs shot=%s bytes=%d",
+                label, resp.status_code, last_request_id or "-", elapsed, ctx.get("shotId", "-"), written,
+            )
+            return True
         except requests.exceptions.RequestException as exc:
-            failures.append(f"{label} 连接失败：{sanitize_text(str(exc))}")
-            return False
-        elapsed = time.monotonic() - started
-        last_status = resp.status_code
-        last_request_id = _request_id_of(resp.headers) or last_request_id
-        if not resp.ok:
-            raw = _raw_text_of(resp)
-            last_excerpt = sanitize_text(raw)
-            failures.append(f"{label} HTTP {resp.status_code}：{last_excerpt or '响应体为空'}")
+            # 连接中断 / ChunkedEncodingError 等：**只算本通道失败**，交给上层回退另一通道。
+            # 这里若把异常漏出去，image_to_video 的 except 兜不住 ⇒ 整步 INTERNAL，
+            # 同批已计费的其余镜产物全丢（违背「单镜失败只降级该镜」）。
+            failures.append(f"{label} 下载中断：{sanitize_text(str(exc))}")
             logger.warning(
-                "[videogen] 下载失败 channel=%s status=%s requestId=%s elapsed=%.2fs shot=%s raw=%r",
-                label, resp.status_code, last_request_id or "-", elapsed,
-                ctx.get("shotId", "-"), last_excerpt,
-            )
-            resp.close()
-            return False
-        content_type = str(resp.headers.get("content-type") or "").lower()
-        if content_type.startswith(("text/", "application/json")):
-            raw = _raw_text_of(resp)
-            last_excerpt = sanitize_text(raw)
-            failures.append(f"{label} 返回的不是视频（{content_type}）：{last_excerpt or '响应体为空'}")
-            logger.warning(
-                "[videogen] 下载失败 channel=%s status=%s content-type=%s shot=%s raw=%r",
-                label, resp.status_code, content_type or "-", ctx.get("shotId", "-"), last_excerpt,
-            )
-            resp.close()
-            return False
-        written = 0
-        with open(dest_path, "wb") as out:
-            for chunk in resp.iter_content(1 << 20):
-                if chunk:
-                    out.write(chunk)
-                    written += len(chunk)
-        resp.close()
-        if written == 0:
-            failures.append(f"{label} 返回空文件（HTTP {resp.status_code}）")
-            logger.warning(
-                "[videogen] 下载失败 channel=%s status=%s 空文件 shot=%s",
-                label, resp.status_code, ctx.get("shotId", "-"),
+                "[videogen] 下载中断 channel=%s shot=%s err=%s",
+                label, ctx.get("shotId", "-"), sanitize_text(str(exc)),
             )
             return False
-        logger.info(
-            "[videogen] 下载完成 channel=%s status=%s requestId=%s elapsed=%.2fs shot=%s bytes=%d",
-            label, resp.status_code, last_request_id or "-", elapsed, ctx.get("shotId", "-"), written,
-        )
-        return True
+        finally:
+            if resp is not None:
+                resp.close()
 
     if url and _try_get(url, {}, "direct"):
         return dest_path, "direct"

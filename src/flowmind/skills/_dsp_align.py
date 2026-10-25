@@ -504,7 +504,9 @@ def consolidate_shots(
     """
     warnings: list[str] = []
     if not shots or not spans or len(shots) != len(spans):
-        return CutResult(list(shots), list(spans), warnings, 0, 0, [max(0, len(shots) - 1) * False])
+        # 守卫路径也要给出与镜数对齐的 boundary_split（长度 = 镜数-1）；原写法
+        # `[n * False]` 实际是 `[0]`（长度为 1），下游按下标取会错判「同镜拆分边界」。
+        return CutResult(list(shots), list(spans), warnings, 0, 0, [False] * max(0, len(shots) - 1))
 
     lo = max(1, int(min_ms))
     hi = max(lo + 1, int(max_ms))

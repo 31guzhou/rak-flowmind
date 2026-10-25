@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -74,6 +75,17 @@ _IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 # 为什么是 2：一次重试足以越过常见的瞬时抖动，又不至于把「配额已尽」这类问题拖成长时间等待
 # （后者分类为 environment、`retriable=False`，**根本不会**进重试）。
 _SUBMIT_ATTEMPTS = 2
+
+# shot_id 来自调用方 timeline（LLM/agent 产出，**非受信输入**）。它会被拼进本地临时文件名与
+# 对象 key：`Path(tmp) / f"{shot_id}.mp4"` 遇到 `/etc/x` 这类值会**直接跳出 tmp**
+# （Python 里 `Path('/tmp') / '/etc/x.mp4'` == `Path('/etc/x.mp4')`），`../` 同理。
+_UNSAFE_STEM_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def safe_file_stem(value: object, *, fallback: str = "shot") -> str:
+    """把外部下发的 shot_id 收敛成安全文件名（只留字母/数字/下划线/连字符，截断 64）。"""
+    stem = _UNSAFE_STEM_RE.sub("_", str(value or "")).strip("._")
+    return (stem or fallback)[:64]
 
 
 class ImageToVideoInput(DspBaseInput):
@@ -494,7 +506,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
     if regen or inp.skipExisting:
         to_generate: list[_Job] = []
         for job in jobs:
-            key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
+            key = common.step_key(
+                inp.cachePrefix, inp.runId, "clips", f"{safe_file_stem(job.shot_id)}.mp4")
             reuse = _should_reuse(storage.exists(key), job.shot_id, regen, inp.skipExisting)
             if reuse:
                 reused_clips.append(ShotClip(
@@ -622,7 +635,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
         frames: list[str] = []
         frame_stats: dict[str, Any] = {}
         trim = common.DspEditTrim()
-        key = common.step_key(inp.cachePrefix, inp.runId, "clips", f"{job.shot_id}.mp4")
+        key = common.step_key(
+            inp.cachePrefix, inp.runId, "clips", f"{safe_file_stem(job.shot_id)}.mp4")
         # ① **厂商侧**：轮询到终态。失败与「前置检查不通过」分开记（reason 不同）。
         poll_request_id = submit_request_id
         try:
@@ -654,7 +668,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                 # `/v1/videos/{task_id}/content`（ADR-126，2026-10-18 真跑取证）。
                 try:
                     local, download_via = videogen.fetch_result(
-                        cfg, task_id, url, str(Path(tmp) / f"{job.shot_id}.mp4"),
+                        cfg, task_id, url,
+                        str(Path(tmp) / f"{safe_file_stem(job.shot_id)}.mp4"),
                         context={"shotId": job.shot_id,
                                  "attemptId": f"{inp.idempotencyKey or inp.runId}:{job.shot_id}"})
                 except videogen.DspVideoGenError as exc:
@@ -671,7 +686,7 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                 if cfg.videogen_trim_window:
                     try:
                         fit = media.clip_to_window(
-                            local, str(Path(tmp) / f"{job.shot_id}.fit.mp4"),
+                            local, str(Path(tmp) / f"{safe_file_stem(job.shot_id)}.fit.mp4"),
                             job.duration_ms, freeze_pad=cfg.videogen_freeze_pad)
                         upload = fit.path
                         trim = common.DspEditTrim(
@@ -701,7 +716,8 @@ def image_to_video(inp: ImageToVideoInput) -> SkillOutput[ImageToVideoData]:
                         frame_stats = qc.frame_stats(sample.paths)
                         for i, path in enumerate(sample.paths):
                             fkey = common.step_key(
-                                inp.cachePrefix, inp.runId, "qa", f"{job.shot_id}-{i}.png")
+                                inp.cachePrefix, inp.runId, "qa",
+                                f"{safe_file_stem(job.shot_id)}-{i}.png")
                             storage.put_file(path, fkey, content_type="image/png")
                             frames.append(fkey)
                         qc_measured += 1
