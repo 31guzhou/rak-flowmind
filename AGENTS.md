@@ -236,3 +236,8 @@ curl http://127.0.0.1:8002/api/v1/manifest          # 技能清单（缺省 15 �
 第一次读到这个文件」段**——装依赖 → 起服务 → health 探活 → MCP 接入三步，
 字段 schema 一律 `GET /api/v1/manifest/<skill_id>` 查询，不猜不读源码。
 架构与不变量见 `CLAUDE.md`。
+
+## Code Review 规范
+
+- 本仓维护冻结：任何改动（含必需的重构/修复）先过代码 review（`/code-review` 或等价流程）再合，且仍须用户明确授权；review 未通过 / P1 未收口不得合并。
+- 合并走 GitHub PR；推送**只推 GitHub `origin`**，GitLab 由 sync Action 镜像，禁止直推 GitLab。
