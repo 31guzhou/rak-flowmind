@@ -1,17 +1,21 @@
-"""调用方凭证校验与租户上下文（ECO-ADR-0011 A 阶段）。
+"""调用方凭证校验与租户上下文（ECO-ADR-0011）。
 
-契约真源 = 生态 ADR `docs/adr/adr-0011-mcp-federation-auth.md`；本模块是
-其 §4b token 格式的 **Python 侧实现**（Go: go-kernel/internal/httpserver，
-TS: cross-dashboard 服务端），三侧必须逐字节一致——防漂移靠 ADR 里的
-固定测试向量（`examples/auth_token_demo.py` 逐字断言同一组字面量）。
+两种凭证形态，按配置二选一（D4 之后**优先 JWT**）：
 
-token 形状：``<base64url(JSON)> "." <hex HMAC-SHA256>``，payload 键序固定
-``{"sub":..,"tid":..,"exp":<unix 秒>}``、无空白分隔符、base64url **不带填充**。
+1. **JWT（RS256，D4 推荐）**：网关用**自己的私钥**签发「网关→后端」那一跳的短命
+   凭证，并公布公钥（``GET /.well-known/jwks.json``）。本服务用标准 JWT 库
+   （PyJWT）+ JWKS 本地验签——**不需要与网关共享任何密钥**。
+   配置：``FLOWMIND_KERNEL_JWKS_URL``（可选 ``FLOWMIND_KERNEL_ISSUER`` /
+   ``FLOWMIND_KERNEL_AUDIENCE`` 收紧校验）。
+2. **HMAC（A 阶段，兼容保留）**：``<base64url(JSON)> "." <hex HMAC-SHA256>``，
+   payload 键序 ``{"sub":..,"tid":..,"exp":..}``，与网关共享 ``FLOWMIND_AUTH_SECRET``。
+   契约真源 = 生态 ADR §4b（Go: go-kernel/internal/httpserver，
+   TS: cross-dashboard 服务端），三侧逐字节一致。
 
 两个平面不要混：
-  * ``secret`` 为空 → **鉴权整体关闭**（dev / 独立部署语义：现有 demo 与
+  * 两者都未配置 → **鉴权整体关闭**（dev / 独立部署语义：现有 demo 与
     直连用法不受影响，任务不记租户）。
-  * ``secret`` 已配 → 每个请求都必须带合法凭证；技能/仓储层拿不到凭证时
+  * 任一已配置 → 每个请求都必须带合法凭证；技能/仓储层拿不到凭证时
     **fail-closed**（拒绝访问，而不是退化成"看全部"）。安全上只有这两种
     取值，不存在"有鉴权但匿名可见全部"的中间态。
 """
@@ -26,12 +30,13 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 __all__ = [
     "Caller",
     "TokenError",
     "auth_enforced",
+    "auth_jwks_url",
     "bind_caller",
     "current_caller",
     "tenant_scope",
@@ -60,15 +65,22 @@ _caller: ContextVar[Caller | None] = ContextVar("flowmind_caller", default=None)
 
 
 def auth_secret() -> str:
-    """生效的校验密钥（env ``FLOWMIND_AUTH_SECRET`` → config ``auth.secret``）。"""
+    """生效的 HMAC 校验密钥（env ``FLOWMIND_AUTH_SECRET`` → config ``auth.secret``）。"""
     from flowmind.config import get_config
 
     return (get_config().auth.secret or "").strip()
 
 
+def auth_jwks_url() -> str:
+    """生效的网关 JWKS 地址（env ``FLOWMIND_KERNEL_JWKS_URL``）；空 = 不走 JWT。"""
+    from flowmind.config import get_config
+
+    return (get_config().auth.kernel_jwks_url or "").strip()
+
+
 def auth_enforced() -> bool:
-    """是否启用凭证校验（密钥非空即启用）。"""
-    return bool(auth_secret())
+    """是否启用凭证校验（JWT 或 HMAC 任一配置即启用）。"""
+    return bool(auth_jwks_url() or auth_secret())
 
 
 def current_caller() -> Caller | None:
@@ -113,12 +125,17 @@ def tenant_scope() -> tuple[bool, str | None]:
 def verify_token(token: str, *, now: float | None = None) -> Caller:
     """校验 Bearer token 并还原调用方身份。
 
-    顺序铁律：**先验签再解 JSON**——签名不匹配的载荷绝不进反序列化，
-    避免把攻击者可控字节喂给 JSON 解析器。
+    分派：配置了 ``kernel_jwks_url`` → JWT（RS256 + JWKS 本地验签）；
+    否则 → HMAC 共享密钥。两条路径的**顺序铁律一致**：先验签再解载荷。
     """
+    jwks_url = auth_jwks_url()
+    if jwks_url:
+        return _verify_jwt(token, jwks_url, now=now)
+
     secret = auth_secret()
     if not secret:
-        raise TokenError("auth_disabled", "未配置 FLOWMIND_AUTH_SECRET，无法校验凭证")
+        raise TokenError("auth_disabled",
+                         "未配置 FLOWMIND_AUTH_SECRET / FLOWMIND_KERNEL_JWKS_URL，无法校验凭证")
     raw = (token or "").strip()
     b64, sep, sig = raw.partition(".")
     if not sep or not b64 or not sig:
@@ -137,7 +154,69 @@ def verify_token(token: str, *, now: float | None = None) -> Caller:
         raise TokenError("malformed", "token 载荷无法解析") from exc
     if not isinstance(payload, dict):
         raise TokenError("malformed", "token 载荷不是 JSON object")
+    return _caller_from_payload(payload, now=now)
 
+
+# ── D4：网关自签 RS256 的本地验签（标准库做标准事）──────────────────────
+# PyJWKClient 自带 JWKS 拉取 + kid 缓存 + 轮换失效，不自己实现。
+_jwk_clients: dict[str, Any] = {}
+
+
+def _jwks_client(url: str):
+    from jwt import PyJWKClient
+
+    client = _jwk_clients.get(url)
+    if client is None:
+        client = PyJWKClient(url, cache_keys=True, lifespan=300)
+        _jwk_clients[url] = client
+    return client
+
+
+def _verify_jwt(token: str, jwks_url: str, *, now: float | None = None) -> Caller:
+    """用网关公布的 JWKS 验 RS256 JWT。
+
+    校验项：算法白名单（只允许 RS256）、``exp``（必填）、可选的
+    ``iss`` / ``aud``（配置了才校验，向后兼容未带这两项的签发方）。
+    """
+    try:
+        import jwt as pyjwt
+    except ImportError as exc:  # 依赖缺失 → 按"鉴权不可用"处理，而非 500
+        raise TokenError("auth_disabled", "缺少 pyjwt 依赖（pip install 'pyjwt[crypto]'）") from exc
+
+    from flowmind.config import get_config
+
+    cfg = get_config().auth
+    raw = (token or "").strip()
+    if raw.count(".") != 2:
+        raise TokenError("malformed", "token 形状非法（期望 JWT 三段）")
+
+    try:
+        signing_key = _jwks_client(jwks_url).get_signing_key_from_jwt(raw)
+    except Exception as exc:  # 网络/解析/kid 未命中一律按验签失败处理
+        raise TokenError("jwks", "无法从网关 JWKS 取得验签公钥") from exc
+
+    options = {
+        "verify_exp": False,          # 过期用 now 手工判，便于测试注入时间
+        "verify_aud": bool(cfg.kernel_audience),
+        "verify_iss": bool(cfg.kernel_issuer),
+        "require": ["exp"],
+    }
+    kwargs: dict[str, Any] = {"algorithms": ["RS256"], "options": options}
+    if cfg.kernel_audience:
+        kwargs["audience"] = cfg.kernel_audience
+    if cfg.kernel_issuer:
+        kwargs["issuer"] = cfg.kernel_issuer
+
+    try:
+        payload = pyjwt.decode(raw, signing_key.key, **kwargs)
+    except pyjwt.InvalidTokenError as exc:  # 签名错/算法不符/缺 exp/iss·aud 不匹配
+        raise TokenError("signature", "token 验签失败") from exc
+
+    return _caller_from_payload(payload, now=now)
+
+
+def _caller_from_payload(payload: dict[str, Any], *, now: float | None = None) -> Caller:
+    """把已验签的载荷还原为 Caller（两条凭证形态共用）。"""
     exp = payload.get("exp")
     if not isinstance(exp, (int, float)) or isinstance(exp, bool):
         raise TokenError("malformed", "token 缺少合法的 exp")

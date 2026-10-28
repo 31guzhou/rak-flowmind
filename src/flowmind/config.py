@@ -638,6 +638,14 @@ class AuthConfig(BaseModel):
 
     secret: str = Field(default="", validate_default=True)  # env FLOWMIND_AUTH_SECRET
 
+    # ── D4：网关自签 RS256，后端用网关公钥本地验签（ECO-ADR-0011 D4）──
+    # 非空 → 走 JWT 路径（优先于共享密钥 HMAC）；空 → 维持 A 阶段 HMAC。
+    # 例：http://go-kernel.core-api.svc:8090/.well-known/jwks.json
+    kernel_jwks_url: str = Field(default="", validate_default=True)  # env FLOWMIND_KERNEL_JWKS_URL
+    # 期望的 iss / aud；留空 = 跳过对应校验（向后兼容未带这两项的签发方）。
+    kernel_issuer: str = Field(default="", validate_default=True)  # env FLOWMIND_KERNEL_ISSUER
+    kernel_audience: str = Field(default="", validate_default=True)  # env FLOWMIND_KERNEL_AUDIENCE
+
     # 豁免在凭证之外的路径前缀：健康探针（K8s probe）与发现面（manifest）
     # 必须匿名可达，否则集群探针永久失败。
     exempt_prefixes: list[str] = Field(
@@ -648,6 +656,17 @@ class AuthConfig(BaseModel):
     def _env_secret(cls, v: str) -> str:
         """env FLOWMIND_AUTH_SECRET 覆盖（空值不生效，回落 config/默认）。"""
         return os.environ.get("FLOWMIND_AUTH_SECRET", "").strip() or v
+
+    @field_validator("kernel_jwks_url", "kernel_issuer", "kernel_audience", mode="before")
+    @classmethod
+    def _env_kernel_jwt(cls, v: str, info: ValidationInfo) -> str:
+        """env 覆盖 D4 三项配置（空值不生效，回落 config/默认）。"""
+        env_names = {
+            "kernel_jwks_url": "FLOWMIND_KERNEL_JWKS_URL",
+            "kernel_issuer": "FLOWMIND_KERNEL_ISSUER",
+            "kernel_audience": "FLOWMIND_KERNEL_AUDIENCE",
+        }
+        return os.environ.get(env_names[info.field_name], "").strip() or v
 
 
 class InfraConfig(BaseModel):
